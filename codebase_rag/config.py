@@ -30,11 +30,13 @@ class AppConfig(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
+        extra="ignore",  # Ignore extra fields from environment variables
     )
 
     MEMGRAPH_HOST: str = "localhost"
     MEMGRAPH_PORT: int = 7687
     MEMGRAPH_HTTP_PORT: int = 7444
+    MCP_HTTP_PORT: int = 7445
     LAB_PORT: int = 3000
 
     GEMINI_PROVIDER: Literal["gla", "vertex"] = "gla"
