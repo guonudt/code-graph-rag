@@ -10,14 +10,28 @@ import sys
 from pathlib import Path
 from typing import Any
 
+# Add the project root to Python path for direct execution
+if __name__ == "__main__":
+    project_root = Path(__file__).parent.parent
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+
 from mcp.server import fastmcp
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from .config import settings
-from .graph_updater import MemgraphIngestor
-from .services.llm import CypherGenerator
-from .tools.code_retrieval import CodeRetriever
+try:
+    # Try relative imports first (when run as module)
+    from .config import settings
+    from .graph_updater import MemgraphIngestor
+    from .services.llm import CypherGenerator
+    from .tools.code_retrieval import CodeRetriever
+except ImportError:
+    # Fall back to absolute imports (when run directly)
+    from codebase_rag.config import settings
+    from codebase_rag.graph_updater import MemgraphIngestor
+    from codebase_rag.services.llm import CypherGenerator
+    from codebase_rag.tools.code_retrieval import CodeRetriever
 
 # Configure logging
 logging.basicConfig(

@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "code-graph-rag": {
+      "name": "Code Graph RAG",
+      "type": "HTTP",
+      "url": "http://localhost:7445/sse",
+      "description": "Code Graph RAG MCP Server for Cherry Studio"
+    }
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "code-graph-rag": {
+      "name": "Code Graph RAG",
+      "type": "STDIO",
+      "command": "/Users/guoshuai/git/code-graph-rag/start_for_cherry_studio.sh",
+      "args": []
+    }
+  }
+}

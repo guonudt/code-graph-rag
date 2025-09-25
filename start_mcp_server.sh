@@ -29,7 +29,7 @@ fi
 
 REPO_PATH="$1"
 TRANSPORT_MODE="${2:-stdio}"
-HTTP_PORT="${3:-7444}"
+HTTP_PORT="${3:-7445}"
 API_KEY="${4:-}"
 
 # Validate transport mode
@@ -127,7 +127,7 @@ fi
 
 # Start the server using python -m
 if [[ "$TRANSPORT_MODE" == "http" ]]; then
-    python -m codebase_rag.mcp_server http
+    source venv/bin/activate && python -m codebase_rag.mcp_server http
 else
-    python -m codebase_rag.mcp_server stdio
+    source venv/bin/activate && python -m codebase_rag.mcp_server stdio
 fi
