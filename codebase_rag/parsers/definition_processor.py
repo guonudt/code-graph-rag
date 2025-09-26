@@ -1270,19 +1270,25 @@ class DefinitionProcessor:
 
             # Skip the original class (we're looking for parent methods)
             if current_class != class_qn:
-                parent_method_qn = f"{current_class}.{method_name}"
-
-                # Check if this parent class has the method
-                if parent_method_qn in self.function_registry:
-                    self.ingestor.ensure_relationship_batch(
-                        ("Method", "qualified_name", method_qn),
-                        "OVERRIDES",
-                        ("Method", "qualified_name", parent_method_qn),
-                    )
-                    logger.debug(
-                        f"Method override: {method_qn} OVERRIDES {parent_method_qn}"
-                    )
-                    return  # Found the nearest override, stop searching
+                # Look for methods with the same name in parent class
+                # In Java, we need to check for method signature compatibility
+                for parent_method_qn in self.function_registry.keys():
+                    if self.function_registry[
+                        parent_method_qn
+                    ] == "Method" and parent_method_qn.startswith(
+                        f"{current_class}.{method_name}"
+                    ):
+                        # Found a method with the same name in parent class
+                        # For Java, we consider this an override (signature checking is complex)
+                        self.ingestor.ensure_relationship_batch(
+                            ("Method", "qualified_name", method_qn),
+                            "OVERRIDES",
+                            ("Method", "qualified_name", parent_method_qn),
+                        )
+                        logger.debug(
+                            f"Method override: {method_qn} OVERRIDES {parent_method_qn}"
+                        )
+                        return  # Found the nearest override, stop searching
 
             # Add parent classes to queue for next level of BFS
             if current_class in self.class_inheritance:

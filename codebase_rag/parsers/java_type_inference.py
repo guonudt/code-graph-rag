@@ -763,22 +763,20 @@ class JavaTypeInferenceEngine:
 
         # Check for 'this' reference - find the containing class
         if object_ref == "this":
-            # Look for any class in the current module (simplified)
-            for qn, entity_type in self.function_registry.items():
-                if entity_type == "Class" and qn.startswith(module_qn + "."):
-                    return str(qn)
+            # Find the current class context more precisely
+            current_class_qn = self._get_current_class_name(module_qn)
+            if current_class_qn:
+                return current_class_qn
             return None
 
         # Check for 'super' reference
         if object_ref == "super":
-            # For super calls, we need to look at parent classes
-            # This is a simplified implementation
-            for qn, entity_type in self.function_registry.items():
-                if entity_type == "Class" and qn.startswith(module_qn + "."):
-                    # Look for parent classes - simplified approach
-                    parent_qn = self._find_parent_class(qn)
-                    if parent_qn:
-                        return parent_qn
+            # Find the current class and its parent
+            current_class_qn = self._get_current_class_name(module_qn)
+            if current_class_qn:
+                parent_qn = self._find_parent_class(current_class_qn)
+                if parent_qn:
+                    return parent_qn
             return None
 
         # Check if it's a static class reference
@@ -1038,15 +1036,26 @@ class JavaTypeInferenceEngine:
                 # Found the target class, now look for extends clause
                 superclass_node = node.child_by_field_name("superclass")
                 if superclass_node:
-                    # Extract the superclass type using tree-sitter field access
-                    type_node = superclass_node.child_by_field_name("type")
-                    if type_node:
-                        superclass_name = safe_decode_text(type_node)
-                        if superclass_name:
-                            # Resolve to fully qualified name
-                            return self._resolve_java_type_name(
-                                superclass_name, module_qn
-                            )
+                    # Extract the superclass type - handle different node types
+                    if superclass_node.type == "type_identifier":
+                        superclass_name = safe_decode_text(superclass_node)
+                    elif superclass_node.type == "generic_type":
+                        # Handle generic superclass like Class<T>
+                        for child in superclass_node.children:
+                            if child.type == "type_identifier":
+                                superclass_name = safe_decode_text(child)
+                                break
+                        else:
+                            superclass_name = None
+                    elif superclass_node.type == "scoped_identifier":
+                        # Handle scoped superclass names like java.lang.Object
+                        superclass_name = safe_decode_text(superclass_node)
+                    else:
+                        superclass_name = None
+
+                    if superclass_name:
+                        # Resolve to fully qualified name
+                        return self._resolve_java_type_name(superclass_name, module_qn)
 
         # Recursively traverse children using tree-sitter
         for child in node.children:

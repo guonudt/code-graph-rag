@@ -97,14 +97,22 @@ def extract_java_import_path(import_node: Node) -> dict[str, str]:
     imported_path = None
     is_wildcard = False
 
-    # Parse import declaration
+    # Parse import declaration more comprehensively
     for child in import_node.children:
         if child.type == "static":
-            pass
+            pass  # Static imports are handled the same way as regular imports
         elif child.type == "scoped_identifier":
+            # Handle scoped identifiers like java.util.List
             imported_path = safe_decode_text(child)
         elif child.type == "identifier":
-            imported_path = safe_decode_text(child)
+            # Handle simple identifiers
+            if imported_path:
+                # Append to existing path
+                child_text = safe_decode_text(child)
+                if child_text:
+                    imported_path += "." + child_text
+            else:
+                imported_path = safe_decode_text(child)
         elif child.type == "asterisk":
             is_wildcard = True
 
@@ -199,6 +207,9 @@ def extract_java_class_info(class_node: Node) -> JavaClassInfo:
                             if sub_child.type == "type_identifier":
                                 interface_name = safe_decode_text(sub_child)
                                 break
+                    elif type_child.type == "scoped_identifier":
+                        # Handle scoped interface names like java.io.Serializable
+                        interface_name = safe_decode_text(type_child)
                     if interface_name:
                         info["interfaces"].append(interface_name)
 
