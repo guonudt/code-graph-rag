@@ -185,9 +185,34 @@ class MemgraphIngestor:
         logger.info("--- Flushing complete. ---")
 
     def fetch_all(self, query: str, params: dict[str, Any] | None = None) -> list:
-        """Executes a query and fetches all results."""
-        logger.debug(f"Executing fetch query: {query} with params: {params}")
-        return self._execute_query(query, params)
+        """Executes a query and fetches all results with enhanced logging and result formatting."""
+        logger.info(f"🔍 Executing query: {query}")
+        if params:
+            logger.info(f"📋 Query parameters: {params}")
+
+        import time
+
+        start_time = time.time()
+
+        try:
+            results = self._execute_query(query, params)
+            execution_time = time.time() - start_time
+
+            logger.info(f"✅ Query executed successfully in {execution_time:.3f}s")
+            logger.info(f"📊 Retrieved {len(results)} result(s)")
+
+            # Print query results in a formatted way
+            if results:
+                self._print_query_results(results, query)
+            else:
+                logger.info("📭 No results found for this query")
+
+            return results
+
+        except Exception as e:
+            execution_time = time.time() - start_time
+            logger.error(f"❌ Query failed after {execution_time:.3f}s: {e}")
+            raise
 
     def execute_write(self, query: str, params: dict[str, Any] | None = None) -> None:
         """Executes a write query without returning results."""
@@ -230,3 +255,151 @@ class MemgraphIngestor:
     def _get_current_timestamp(self) -> str:
         """Get current timestamp in ISO format."""
         return datetime.now(UTC).isoformat()
+
+    def _print_query_results(self, results: list, query: str) -> None:
+        """Print query results in a formatted and readable way."""
+        if not results:
+            return
+
+        # Determine if this is a simple or complex query result
+        is_simple_result = len(results[0].keys()) <= 3 and all(
+            isinstance(v, str | int | float | bool) or v is None
+            for v in results[0].values()
+        )
+
+        if is_simple_result and len(results) <= 10:
+            # Print simple results in a clean format
+            logger.info("📋 Query Results:")
+            for i, row in enumerate(results, 1):
+                logger.info(f"  Result {i}:")
+                for key, value in row.items():
+                    if value is None:
+                        logger.info(f"    {key}: null")
+                    elif isinstance(value, bool):
+                        logger.info(f"    {key}: {'✓' if value else '✗'}")
+                    elif isinstance(value, int | float):
+                        logger.info(f"    {key}: {value}")
+                    else:
+                        # Truncate long strings
+                        str_value = str(value)
+                        if len(str_value) > 100:
+                            str_value = str_value[:97] + "..."
+                        logger.info(f"    {key}: {str_value}")
+                logger.info("")  # Empty line between results
+        else:
+            # For complex results or many results, show a summary
+            logger.info("📋 Query Results Summary:")
+            logger.info(f"  Total results: {len(results)}")
+            logger.info(f"  Columns: {', '.join(results[0].keys())}")
+
+            # Show first few results as examples
+            max_examples = min(3, len(results))
+            logger.info(f"  First {max_examples} result(s):")
+            for i, row in enumerate(results[:max_examples], 1):
+                logger.info(f"    Example {i}: {dict(row)}")
+
+            if len(results) > max_examples:
+                logger.info(f"    ... and {len(results) - max_examples} more results")
+
+    def get_query_statistics(self, query: str) -> dict[str, Any]:
+        """Get statistics about a query execution."""
+        import time
+
+        start_time = time.time()
+
+        try:
+            results = self._execute_query(query)
+            execution_time = time.time() - start_time
+
+            return {
+                "execution_time": execution_time,
+                "result_count": len(results),
+                "success": True,
+                "query": query,
+            }
+        except Exception as e:
+            execution_time = time.time() - start_time
+            return {
+                "execution_time": execution_time,
+                "result_count": 0,
+                "success": False,
+                "error": str(e),
+                "query": query,
+            }
+
+    def fetch_paginated(
+        self,
+        query: str,
+        page: int = 1,
+        page_size: int = 50,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Execute a query with pagination support."""
+        import time
+
+        start_time = time.time()
+
+        if page < 1:
+            page = 1
+        if page_size < 1:
+            page_size = 50
+        if page_size > 1000:
+            page_size = 1000  # Limit max page size
+
+        offset = (page - 1) * page_size
+
+        try:
+            # Add pagination to the query
+            paginated_query = f"{query.rstrip(';')} SKIP {offset} LIMIT {page_size};"
+
+            # Get total count for pagination info
+            count_query = f"MATCH {query.split('MATCH')[1].split('RETURN')[0]} RETURN count(*) as total"
+            count_result = self._execute_query(count_query, params)
+            total_count = count_result[0]["total"] if count_result else 0
+
+            # Execute paginated query
+            results = self._execute_query(paginated_query, params)
+            execution_time = time.time() - start_time
+
+            # Calculate pagination info
+            total_pages = (total_count + page_size - 1) // page_size
+            has_next = page < total_pages
+            has_prev = page > 1
+
+            logger.info(
+                f"📄 Paginated query: page {page}/{total_pages}, {len(results)}/{total_count} results in {execution_time:.3f}s"
+            )
+
+            return {
+                "results": results,
+                "pagination": {
+                    "page": page,
+                    "page_size": page_size,
+                    "total_count": total_count,
+                    "total_pages": total_pages,
+                    "has_next": has_next,
+                    "has_prev": has_prev,
+                    "offset": offset,
+                },
+                "execution_time": execution_time,
+                "success": True,
+            }
+
+        except Exception as e:
+            execution_time = time.time() - start_time
+            logger.error(f"❌ Paginated query failed after {execution_time:.3f}s: {e}")
+            return {
+                "results": [],
+                "pagination": {
+                    "page": page,
+                    "page_size": page_size,
+                    "total_count": 0,
+                    "total_pages": 0,
+                    "has_next": False,
+                    "has_prev": False,
+                    "offset": offset,
+                },
+                "execution_time": execution_time,
+                "success": False,
+                "error": str(e),
+            }

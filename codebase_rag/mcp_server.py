@@ -4,6 +4,7 @@ Code Graph RAG MCP Server
 支持STDIO和HTTP两种传输模式的MCP服务器
 """
 
+import asyncio
 import logging
 import os
 import sys
@@ -24,14 +25,40 @@ try:
     # Try relative imports first (when run as module)
     from .config import settings
     from .graph_updater import MemgraphIngestor
-    from .services.llm import CypherGenerator
-    from .tools.code_retrieval import CodeRetriever
+    from .services.llm import CypherGenerator, create_rag_orchestrator
+    from .tools.code_retrieval import CodeRetriever, create_code_retrieval_tool
+    from .tools.codebase_query import create_query_tool
+    from .tools.directory_lister import DirectoryLister, create_directory_lister_tool
+    from .tools.document_analyzer import DocumentAnalyzer, create_document_analyzer_tool
+    from .tools.file_editor import FileEditor, create_file_editor_tool
+    from .tools.file_reader import FileReader, create_file_reader_tool
+    from .tools.file_writer import FileWriter, create_file_writer_tool
+    from .tools.shell_command import ShellCommander, create_shell_command_tool
 except ImportError:
     # Fall back to absolute imports (when run directly)
     from codebase_rag.config import settings
     from codebase_rag.graph_updater import MemgraphIngestor
-    from codebase_rag.services.llm import CypherGenerator
-    from codebase_rag.tools.code_retrieval import CodeRetriever
+    from codebase_rag.services.llm import CypherGenerator, create_rag_orchestrator
+    from codebase_rag.tools.code_retrieval import (
+        CodeRetriever,
+        create_code_retrieval_tool,
+    )
+    from codebase_rag.tools.codebase_query import create_query_tool
+    from codebase_rag.tools.directory_lister import (
+        DirectoryLister,
+        create_directory_lister_tool,
+    )
+    from codebase_rag.tools.document_analyzer import (
+        DocumentAnalyzer,
+        create_document_analyzer_tool,
+    )
+    from codebase_rag.tools.file_editor import FileEditor, create_file_editor_tool
+    from codebase_rag.tools.file_reader import FileReader, create_file_reader_tool
+    from codebase_rag.tools.file_writer import FileWriter, create_file_writer_tool
+    from codebase_rag.tools.shell_command import (
+        ShellCommander,
+        create_shell_command_tool,
+    )
 
 # Configure logging
 logging.basicConfig(
@@ -47,14 +74,14 @@ mcp = fastmcp.FastMCP("code-graph-rag")
 
 # Global services (will be initialized when needed)
 ingestor: MemgraphIngestor | None = None
-cypher_generator: CypherGenerator | None = None
-code_retriever: CodeRetriever | None = None
+rag_agent: Any | None = None
 repo_path: Path | None = None
+message_history: list[Any] = []
 
 
 async def ensure_services() -> None:
-    """Ensure all services are initialized."""
-    global ingestor, cypher_generator, code_retriever, repo_path
+    """Ensure all services and RAG agent are initialized."""
+    global ingestor, rag_agent, repo_path
 
     if ingestor is None:
         ingestor = MemgraphIngestor(
@@ -64,29 +91,74 @@ async def ensure_services() -> None:
         ingestor.__enter__()
         logger.info("Initialized MemgraphIngestor")
 
-    if cypher_generator is None:
-        cypher_generator = CypherGenerator()
-        logger.info("Initialized CypherGenerator")
-
     if repo_path is None:
         repo_path = Path(settings.TARGET_REPO_PATH).resolve()
         logger.info(f"Set repository path to: {repo_path}")
 
-    if code_retriever is None:
-        code_retriever = CodeRetriever(str(repo_path), ingestor)
-        logger.info("Initialized CodeRetriever")
+    if rag_agent is None:
+        # Initialize RAG agent with all tools (similar to main.py)
+        logger.info("Initializing RAG agent with full tool set...")
+
+        # Validate settings
+        settings.validate_for_usage()
+
+        # Initialize all services
+        cypher_generator = CypherGenerator()
+        code_retriever = CodeRetriever(project_root=str(repo_path), ingestor=ingestor)
+        file_reader = FileReader(project_root=str(repo_path))
+        file_writer = FileWriter(project_root=str(repo_path))
+        file_editor = FileEditor(project_root=str(repo_path))
+        shell_commander = ShellCommander(
+            project_root=str(repo_path), timeout=settings.SHELL_COMMAND_TIMEOUT
+        )
+        directory_lister = DirectoryLister(project_root=str(repo_path))
+        document_analyzer = DocumentAnalyzer(project_root=str(repo_path))
+
+        # Create all tools
+        from rich.console import Console
+
+        console = Console(width=None, force_terminal=True)
+
+        query_tool = create_query_tool(ingestor, cypher_generator, console)
+        code_tool = create_code_retrieval_tool(code_retriever)
+        file_reader_tool = create_file_reader_tool(file_reader)
+        file_writer_tool = create_file_writer_tool(file_writer)
+        file_editor_tool = create_file_editor_tool(file_editor)
+        shell_command_tool = create_shell_command_tool(shell_commander)
+        directory_lister_tool = create_directory_lister_tool(directory_lister)
+        document_analyzer_tool = create_document_analyzer_tool(document_analyzer)
+
+        # Create RAG orchestrator with all tools
+        rag_agent = create_rag_orchestrator(
+            tools=[
+                query_tool,
+                code_tool,
+                file_reader_tool,
+                file_writer_tool,
+                file_editor_tool,
+                shell_command_tool,
+                directory_lister_tool,
+                document_analyzer_tool,
+            ]
+        )
+        logger.info("RAG agent initialized with full tool set")
 
 
 @mcp.tool()
 async def query_codebase(query: str) -> str:
-    """Query the codebase knowledge graph using natural language.
+    """Query the codebase using natural language with full RAG capabilities.
 
-    Ask questions about classes, functions, methods, dependencies, or code structure.
+    This tool uses the complete RAG agent with all available tools to provide
+    comprehensive answers about your codebase. It can query the knowledge graph,
+    read files, analyze code, and provide detailed explanations.
+
     Examples:
     - "Find all functions that handle authentication"
     - "What classes are in the user module?"
     - "Show me functions with the longest call chains"
     - "Which files contain database operations?"
+    - "Explain how the authentication system works"
+    - "What are the main components of this application?"
 
     Args:
         query: Natural language question about the codebase
@@ -94,121 +166,231 @@ async def query_codebase(query: str) -> str:
     await ensure_services()
 
     try:
-        logger.info(f"Querying codebase: {query}")
+        import time
 
-        # Generate Cypher query from natural language
-        if cypher_generator is None:
-            return "Error: Cypher generator not initialized"
-        cypher_query = await cypher_generator.generate(query)
-        logger.info(f"Generated Cypher: {cypher_query}")
+        start_time = time.time()
 
-        # Execute query
-        if ingestor is None:
-            return "Error: Memgraph ingestor not initialized"
-        results = ingestor.fetch_all(cypher_query)
+        logger.info(f"🤖 RAG Query: {query}")
 
-        if not results:
-            return f"No results found for query: '{query}'\n\nGenerated Cypher: {cypher_query}"
+        if rag_agent is None:
+            return "❌ Error: RAG agent not initialized"
 
-        # Format results
-        result_text = f"Query: {query}\n"
-        result_text += f"Generated Cypher: {cypher_query}\n\n"
-        result_text += f"Found {len(results)} result(s):\n\n"
+        # Use RAG agent to process the query (similar to run_chat_loop)
+        response = await run_with_cancellation_mcp(
+            rag_agent.run(query, message_history=message_history)
+        )
 
-        for i, row in enumerate(results, 1):
-            result_text += f"Result {i}:\n"
-            for key, value in row.items():
-                result_text += f"  {key}: {value}\n"
-            result_text += "\n"
+        query_time = time.time() - start_time
 
-        logger.info(f"Query completed successfully, found {len(results)} results")
-        return result_text
+        if isinstance(response, dict) and response.get("cancelled"):
+            logger.warning("Query was cancelled")
+            return "⚠️ Query was cancelled by user"
+
+        # Extract the response output
+        if hasattr(response, "output"):
+            result_text = response.output
+        elif isinstance(response, dict) and "output" in response:
+            result_text = response["output"]
+        else:
+            result_text = str(response)
+
+        # Add timing information
+        result_text += f"\n\n⏱️ **Query processed in {query_time:.3f}s**"
+
+        # Update message history
+        if hasattr(response, "new_messages"):
+            message_history.extend(response.new_messages())
+
+        logger.info(f"✅ RAG query completed in {query_time:.3f}s")
+        return str(result_text)
 
     except Exception as e:
-        logger.error(f"Error querying codebase: {e}")
-        return f"Error querying codebase: {str(e)}"
+        error_time = time.time() - start_time if "start_time" in locals() else 0
+        logger.error(f"❌ Error in RAG query after {error_time:.3f}s: {e}")
+        return f"❌ Error processing query: {str(e)}\n⏱️ Failed after: {error_time:.3f}s"
+
+
+async def run_with_cancellation_mcp(coro: Any, timeout: float | None = None) -> Any:
+    """Run a coroutine with proper cancellation handling for MCP context."""
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout) if timeout else await coro
+    except TimeoutError:
+        logger.warning("Query timed out")
+        return {"cancelled": True, "timeout": True}
+    except asyncio.CancelledError:
+        logger.warning("Query was cancelled")
+        return {"cancelled": True}
+    except Exception as e:
+        logger.error(f"Query failed: {e}")
+        raise
 
 
 @mcp.tool()
 async def get_code_snippet(qualified_name: str) -> str:
-    """Retrieve the source code for a specific function, class, or method.
+    """Retrieve the source code for a specific function, class, or method using RAG agent.
 
     Args:
         qualified_name: Fully qualified name of the function, class, or method
                        Examples: "User.authenticate", "database.connection.connect"
     """
-    await ensure_services()
-
-    try:
-        logger.info(f"Retrieving code snippet for: {qualified_name}")
-
-        if code_retriever is None:
-            return "Error: Code retriever not initialized"
-        snippet = await code_retriever.find_code_snippet(qualified_name)
-
-        if not snippet.found:
-            return f"Code snippet not found: {qualified_name}\nError: {snippet.error_message}"
-
-        result_text = f"Code snippet for: {qualified_name}\n"
-        result_text += f"File: {snippet.file_path}\n"
-        result_text += f"Lines: {snippet.line_start}-{snippet.line_end}\n"
-        if snippet.docstring:
-            result_text += f"Docstring: {snippet.docstring}\n"
-        result_text += f"\n```\n{snippet.source_code}\n```"
-
-        logger.info(f"Successfully retrieved code snippet for: {qualified_name}")
-        return result_text
-
-    except Exception as e:
-        logger.error(f"Error retrieving code snippet: {e}")
-        return f"Error retrieving code snippet: {str(e)}"
+    # Use RAG agent to get code snippet with context
+    query = f"Show me the source code for {qualified_name}. Include the file path, line numbers, and any docstring."
+    result = await query_codebase(query)
+    return str(result)
 
 
 @mcp.tool()
 async def get_codebase_summary() -> str:
-    """Get a summary of the codebase structure including languages, file counts, and main components."""
+    """Get a comprehensive summary of the codebase structure using RAG agent."""
+    query = "Provide a comprehensive summary of this codebase. Include the main components, file types, programming languages used, project structure, and key functionality. Also show statistics about the codebase like file counts and node types in the knowledge graph."
+    result = await query_codebase(query)
+    return str(result)
+
+
+@mcp.tool()
+async def query_codebase_paginated(
+    query: str, page: int = 1, page_size: int = 50
+) -> str:
+    """Query the codebase with pagination support using RAG agent.
+
+    This tool is useful for large result sets that need to be browsed page by page.
+    It uses the RAG agent to provide intelligent pagination and context.
+
+    Args:
+        query: Natural language question about the codebase
+        page: Page number to retrieve (default: 1)
+        page_size: Number of results per page (default: 50, max: 1000)
+    """
+    # Use RAG agent for paginated queries with context
+    paginated_query = f"{query}. Please provide results in a paginated format for page {page} with {page_size} items per page. Include pagination information and navigation details."
+    result = await query_codebase(paginated_query)
+    return str(result)
+
+
+@mcp.tool()
+async def debug_query(cypher_query: str) -> str:
+    """Execute a raw Cypher query and return detailed debugging information.
+
+    This tool is useful for testing and debugging Cypher queries directly.
+    It provides detailed execution statistics and formatted results.
+
+    Args:
+        cypher_query: Raw Cypher query to execute
+    """
     await ensure_services()
 
     try:
-        logger.info("Getting codebase summary")
+        import time
 
-        # Query for basic statistics
-        stats_query = """
-        MATCH (n)
-        RETURN labels(n)[0] AS node_type, count(n) AS count
-        ORDER BY count DESC
-        """
+        start_time = time.time()
+
+        logger.info(f"🔧 Debug query: {cypher_query}")
 
         if ingestor is None:
-            return "Error: Memgraph ingestor not initialized"
-        results = ingestor.fetch_all(stats_query)
+            return "❌ Error: Memgraph ingestor not initialized"
 
-        result_text = f"Codebase Summary for: {repo_path}\n\n"
-        result_text += "Node Statistics:\n"
+        # Execute query with detailed timing
+        logger.info("🔄 Executing debug query...")
+        results = ingestor.fetch_all(cypher_query)
 
-        for row in results:
-            result_text += f"  {row['node_type']}: {row['count']}\n"
+        query_time = time.time() - start_time
 
-        # Get language distribution
-        lang_query = """
-        MATCH (f:File)
-        WHERE f.extension IS NOT NULL
-        RETURN f.extension AS extension, count(f) AS count
-        ORDER BY count DESC
-        """
+        # Format debug information
+        debug_text = "🔧 **Debug Query Results**\n"
+        debug_text += f"**Cypher Query:** `{cypher_query}`\n"
+        debug_text += f"**Execution Time:** {query_time:.3f}s\n"
+        debug_text += f"**Result Count:** {len(results)}\n\n"
 
-        lang_results = ingestor.fetch_all(lang_query)
+        if results:
+            # Show column information
+            columns = list(results[0].keys())
+            debug_text += f"**Columns:** {', '.join(columns)}\n\n"
 
-        result_text += "\nFile Types:\n"
-        for row in lang_results:
-            result_text += f"  {row['extension']}: {row['count']}\n"
+            # Show first few results
+            max_debug_results = min(5, len(results))
+            debug_text += f"**First {max_debug_results} result(s):**\n"
 
-        logger.info("Successfully generated codebase summary")
-        return result_text
+            for i, row in enumerate(results[:max_debug_results], 1):
+                debug_text += f"\n**Result {i}:**\n"
+                for key, value in row.items():
+                    if value is None:
+                        debug_text += f"  • {key}: `null`\n"
+                    elif isinstance(value, bool):
+                        debug_text += f"  • {key}: {'✅' if value else '❌'}\n"
+                    elif isinstance(value, int | float):
+                        debug_text += f"  • {key}: `{value}`\n"
+                    else:
+                        str_value = str(value)
+                        if len(str_value) > 100:
+                            str_value = str_value[:97] + "..."
+                        debug_text += f"  • {key}: `{str_value}`\n"
+
+            if len(results) > max_debug_results:
+                debug_text += (
+                    f"\n... and {len(results) - max_debug_results} more results"
+                )
+        else:
+            debug_text += "📭 No results returned"
+
+        logger.info(f"✅ Debug query completed in {query_time:.3f}s")
+        return debug_text
 
     except Exception as e:
-        logger.error(f"Error getting codebase summary: {e}")
-        return f"Error getting codebase summary: {str(e)}"
+        error_time = time.time() - start_time if "start_time" in locals() else 0
+        logger.error(f"❌ Debug query failed after {error_time:.3f}s: {e}")
+        return f"❌ Debug query error: {str(e)}\n⏱️ Failed after: {error_time:.3f}s"
+
+
+@mcp.tool()
+async def analyze_code_structure() -> str:
+    """Analyze the overall code structure and architecture using RAG agent."""
+    query = "Analyze the codebase structure and architecture. Identify the main components, design patterns used, dependencies between modules, and overall architecture style. Provide insights about how the code is organized."
+    result = await query_codebase(query)
+    return str(result)
+
+
+@mcp.tool()
+async def find_code_patterns(pattern_description: str) -> str:
+    """Find specific code patterns or implementations using RAG agent.
+
+    Args:
+        pattern_description: Description of the pattern to find (e.g., "authentication", "database connections", "error handling")
+    """
+    query = f"Find and analyze code patterns related to: {pattern_description}. Show me examples of how this pattern is implemented throughout the codebase, including file locations and code snippets."
+    result = await query_codebase(query)
+    return str(result)
+
+
+@mcp.tool()
+async def explain_code_flow(starting_point: str) -> str:
+    """Explain how code flows from a specific starting point using RAG agent.
+
+    Args:
+        starting_point: The starting point for code flow analysis (e.g., "main function", "API endpoint", "user login")
+    """
+    query = f"Explain the code flow starting from: {starting_point}. Trace through the execution path, show me the key functions and methods called, and explain how data flows through the system."
+    result = await query_codebase(query)
+    return str(result)
+
+
+@mcp.tool()
+async def get_dependencies(component: str) -> str:
+    """Get dependencies and relationships for a specific component using RAG agent.
+
+    Args:
+        component: The component to analyze (e.g., "User class", "database module", "authentication service")
+    """
+    query = f"Show me the dependencies and relationships for: {component}. Include what this component depends on, what depends on it, and how it integrates with the rest of the system."
+    result = await query_codebase(query)
+    return str(result)
+
+
+@mcp.tool()
+async def suggest_improvements() -> str:
+    """Get suggestions for code improvements using RAG agent."""
+    query = "Analyze this codebase and suggest potential improvements. Look for code quality issues, performance optimizations, security concerns, maintainability improvements, and best practices that could be applied."
+    result = await query_codebase(query)
+    return str(result)
 
 
 @mcp.tool()
@@ -359,8 +541,15 @@ if __name__ == "__main__":
         # Register all tools with the new instance
         # We know the tools from the original mcp instance, so we can register them directly
         http_mcp.tool()(query_codebase)
+        http_mcp.tool()(query_codebase_paginated)
         http_mcp.tool()(get_code_snippet)
         http_mcp.tool()(get_codebase_summary)
+        http_mcp.tool()(debug_query)
+        http_mcp.tool()(analyze_code_structure)
+        http_mcp.tool()(find_code_patterns)
+        http_mcp.tool()(explain_code_flow)
+        http_mcp.tool()(get_dependencies)
+        http_mcp.tool()(suggest_improvements)
         http_mcp.tool()(health_check)
 
         # Add the health endpoint
