@@ -1,6 +1,5 @@
 from collections import defaultdict
-from datetime import datetime
-from datetime import timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import mgclient
@@ -255,7 +254,7 @@ class MemgraphIngestor:
 
     def _get_current_timestamp(self) -> str:
         """Get current timestamp in ISO format."""
-        return datetime.now(timezone.utc).isoformat()
+        return datetime.now(UTC).isoformat()
 
     def _print_query_results(self, results: list, query: str) -> None:
         """Print query results in a formatted and readable way."""
