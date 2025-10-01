@@ -118,14 +118,15 @@ class MemgraphIngestor:
         """Adds a relationship to the buffer."""
         from_label, from_key, from_val = from_spec
         to_label, to_key, to_val = to_spec
-        self.relationship_buffer.append(
-            (
-                (from_label, from_key, from_val),
-                rel_type,
-                (to_label, to_key, to_val),
-                properties,
-            )
+
+        relationship_entry = (
+            (from_label, from_key, from_val),
+            rel_type,
+            (to_label, to_key, to_val),
+            properties,
         )
+
+        self.relationship_buffer.append(relationship_entry)
 
     def flush_nodes(self) -> None:
         """Flushes the buffered nodes to the database."""
@@ -165,6 +166,7 @@ class MemgraphIngestor:
             rels_by_pattern[pattern].append(
                 {"from_val": from_node[2], "to_val": to_node[2], "props": props or {}}
             )
+
         for pattern, params_list in rels_by_pattern.items():
             from_label, from_key, rel_type, to_label, to_key = pattern
             query = (
@@ -174,7 +176,17 @@ class MemgraphIngestor:
             )
             if any(p["props"] for p in params_list):
                 query += "\nSET r += row.props"
-            self._execute_batch(query, params_list)
+
+            try:
+                self._execute_batch(query, params_list)
+            except Exception as e:
+                logger.error(
+                    f"❌ Failed to write relationships of type {rel_type}: {e}"
+                )
+                logger.error(f"   Query: {query}")
+                logger.error(f"   Parameters: {params_list}")
+                raise
+
         logger.info(f"Flushed {len(self.relationship_buffer)} relationships.")
         self.relationship_buffer.clear()
 

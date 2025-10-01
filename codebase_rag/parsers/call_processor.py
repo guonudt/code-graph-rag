@@ -171,8 +171,13 @@ class CallProcessor:
         self, root_node: Node, module_qn: str, language: str, queries: dict[str, Any]
     ) -> None:
         """Process calls within class methods."""
+        logger.debug(
+            f"🔍 Processing calls in classes for module: '{module_qn}' (language: {language})"
+        )
+
         lang_queries = queries[language]
         if not lang_queries.get("classes"):
+            logger.debug(f"❌ No classes query found for language: {language}")
             return
 
         query = lang_queries["classes"]
@@ -180,37 +185,75 @@ class CallProcessor:
         captures = cursor.captures(root_node)
         class_nodes = captures.get("class", [])
 
-        for class_node in class_nodes:
+        logger.debug(f"📊 Found {len(class_nodes)} class nodes in module '{module_qn}'")
+
+        if not class_nodes:
+            logger.debug(f"📭 No classes found in module '{module_qn}'")
+            return
+
+        for i, class_node in enumerate(class_nodes, 1):
             if not isinstance(class_node, Node):
+                logger.debug(f"⚠️ Class node {i} is not a valid Node instance")
                 continue
+
             name_node = class_node.child_by_field_name("name")
             if not name_node:
+                logger.debug(f"⚠️ Class node {i} has no name field")
                 continue
+
             text = name_node.text
             if text is None:
+                logger.debug(f"⚠️ Class node {i} name text is None")
                 continue
+
             class_name = text.decode("utf8")
             class_qn = f"{module_qn}.{class_name}"
 
+            logger.debug(
+                f"🏗️ Processing class {i}/{len(class_nodes)}: '{class_name}' (qn: '{class_qn}')"
+            )
+
             body_node = class_node.child_by_field_name("body")
             if not body_node:
+                logger.debug(f"⚠️ Class '{class_name}' has no body field")
                 continue
 
             method_query = lang_queries["functions"]
             method_cursor = QueryCursor(method_query)
             method_captures = method_cursor.captures(body_node)
             method_nodes = method_captures.get("function", [])
-            for method_node in method_nodes:
+
+            logger.debug(
+                f"📊 Found {len(method_nodes)} methods in class '{class_name}'"
+            )
+
+            for j, method_node in enumerate(method_nodes, 1):
                 if not isinstance(method_node, Node):
+                    logger.debug(
+                        f"⚠️ Method node {j} in class '{class_name}' is not a valid Node instance"
+                    )
                     continue
+
                 method_name_node = method_node.child_by_field_name("name")
                 if not method_name_node:
+                    logger.debug(
+                        f"⚠️ Method node {j} in class '{class_name}' has no name field"
+                    )
                     continue
+
                 text = method_name_node.text
                 if text is None:
+                    logger.debug(
+                        f"⚠️ Method node {j} in class '{class_name}' name text is None"
+                    )
                     continue
+
                 method_name = text.decode("utf8")
                 method_qn = f"{class_qn}.{method_name}"
+
+                logger.debug(
+                    f"🔧 Processing method {j}/{len(method_nodes)}: '{method_name}' (qn: '{method_qn}')"
+                )
 
                 self._ingest_function_calls(
                     method_node,
@@ -226,10 +269,167 @@ class CallProcessor:
         self, root_node: Node, module_qn: str, language: str, queries: dict[str, Any]
     ) -> None:
         """Process top-level calls in the module (like IIFE calls)."""
-        # Process calls that are directly at module level, not inside functions/classes
-        self._ingest_function_calls(
-            root_node, module_qn, "Module", module_qn, language, queries
+        logger.debug(
+            f"🔍 Processing calls for module level: '{module_qn}' (language: {language})"
         )
+
+        # For Java, we need to exclude call nodes that are already inside methods/functions
+        # to avoid duplicate processing
+        if language == "java":
+            self._ingest_module_level_calls_excluding_methods(
+                root_node, module_qn, language, queries
+            )
+        else:
+            # Process calls that are directly at module level, not inside functions/classes
+            self._ingest_function_calls(
+                root_node, module_qn, "Module", module_qn, language, queries
+            )
+
+    def _ingest_module_level_calls_excluding_methods(
+        self, root_node: Node, module_qn: str, language: str, queries: dict[str, Any]
+    ) -> None:
+        """Process module-level calls excluding those already inside methods/functions."""
+        calls_query = queries[language].get("calls")
+        if not calls_query:
+            return
+
+        # Get all call nodes in the root
+        cursor = QueryCursor(calls_query)
+        captures = cursor.captures(root_node)
+        all_call_nodes = captures.get("call", [])
+
+        # Filter out call nodes that are inside methods or functions
+        module_level_call_nodes = []
+        for call_node in all_call_nodes:
+            if not isinstance(call_node, Node):
+                continue
+
+            # Check if this call node is inside a method or function
+            if not self._is_call_inside_method_or_function(call_node, language):
+                module_level_call_nodes.append(call_node)
+
+        logger.debug(
+            f"Found {len(module_level_call_nodes)} module-level call nodes "
+            f"(filtered from {len(all_call_nodes)} total call nodes)"
+        )
+
+        # Process the filtered call nodes
+        local_var_types = self.type_inference.build_local_variable_type_map(
+            root_node, module_qn, language
+        )
+
+        for i, call_node in enumerate(module_level_call_nodes, 1):
+            call_text = call_node.text.decode("utf8") if call_node.text else "unknown"
+            call_type = call_node.type
+
+            logger.debug(
+                f"📞 Processing module-level call node {i}/{len(module_level_call_nodes)}: '{call_text}' (type: {call_type})"
+            )
+
+            # Process nested calls first (inner to outer)
+            self._process_nested_calls_in_node(
+                call_node,
+                module_qn,
+                "Module",
+                module_qn,
+                local_var_types,
+                None,  # No class context for module-level calls
+            )
+
+            call_name = self._get_call_target_name(call_node)
+            if not call_name:
+                logger.debug(
+                    f"❌ Could not extract call name from module-level call node {i}"
+                )
+                continue
+
+            logger.debug(f"📝 Extracted call name: '{call_name}'")
+
+            # Use Java-specific resolution for Java method calls
+            if language == "java" and call_node.type == "method_invocation":
+                callee_info = self._resolve_java_method_call(
+                    call_node, module_qn, local_var_types
+                )
+            else:
+                callee_info = self._resolve_function_call(
+                    call_name, module_qn, local_var_types, None
+                )
+
+            if not callee_info:
+                # Check if it's a built-in JavaScript method
+                builtin_info = self._resolve_builtin_call(call_name)
+                if not builtin_info:
+                    # Check if it's a C++ operator
+                    operator_info = self._resolve_cpp_operator_call(
+                        call_name, module_qn
+                    )
+                    if not operator_info:
+                        continue
+                    callee_type, callee_qn = operator_info
+                else:
+                    callee_type, callee_qn = builtin_info
+            else:
+                callee_type, callee_qn = callee_info
+
+            logger.debug(
+                f"      Found module-level call from {module_qn} to {call_name} "
+                f"(resolved as {callee_type}:{callee_qn})"
+            )
+
+            self.ingestor.ensure_relationship_batch(
+                ("Module", "qualified_name", module_qn),
+                "CALLS",
+                (callee_type, "qualified_name", callee_qn),
+            )
+
+    def _is_call_inside_method_or_function(
+        self, call_node: Node, language: str
+    ) -> bool:
+        """Check if a call node is inside a method or function."""
+        current = call_node.parent
+        while current:
+            # Check for method/function nodes based on language
+            if language == "java":
+                if current.type in ["method_declaration", "constructor_declaration"]:
+                    return True
+            elif language == "python":
+                if current.type in ["function_definition", "method_definition"]:
+                    return True
+            elif language in ["javascript", "typescript"]:
+                if current.type in [
+                    "function_declaration",
+                    "function_expression",
+                    "method_definition",
+                ]:
+                    return True
+            elif language == "cpp":
+                if current.type in ["function_definition", "method_definition"]:
+                    return True
+
+            # For Java, we need more precise handling of class bodies
+            if language == "java" and current.type == "class_body":
+                # Check if we're inside a static block - if so, this is module-level code
+                # and should NOT be filtered out
+                if self._is_inside_static_block(call_node):
+                    return False
+                # Otherwise, if we're in a class body, we're likely inside a method
+                return True
+
+            current = current.parent
+
+        return False
+
+    def _is_inside_static_block(self, call_node: Node) -> bool:
+        """Check if a call node is inside a static block in Java."""
+        current = call_node.parent
+        while current:
+            if current.type == "static_initializer":
+                return True
+            # If we hit a method or constructor, we're not in a static block
+            if current.type in ["method_declaration", "constructor_declaration"]:
+                return False
+            current = current.parent
+        return False
 
     def _get_call_target_name(self, call_node: Node) -> str | None:
         """Extracts the name of the function or method being called."""
@@ -347,9 +547,18 @@ class CallProcessor:
             f"Found {len(call_nodes)} call nodes in {language} for {caller_qn}"
         )
 
-        for call_node in call_nodes:
+        for i, call_node in enumerate(call_nodes, 1):
             if not isinstance(call_node, Node):
+                logger.debug(f"⚠️ Call node {i} is not a valid Node instance")
                 continue
+
+            # Extract basic call node information for debugging
+            call_text = call_node.text.decode("utf8") if call_node.text else "unknown"
+            call_type = call_node.type
+
+            logger.debug(
+                f"📞 Processing call node {i}/{len(call_nodes)}: '{call_text}' (type: {call_type})"
+            )
 
             # Process nested calls first (inner to outer)
             self._process_nested_calls_in_node(
@@ -363,7 +572,10 @@ class CallProcessor:
 
             call_name = self._get_call_target_name(call_node)
             if not call_name:
+                logger.debug(f"❌ Could not extract call name from call node {i}")
                 continue
+
+            logger.debug(f"📝 Extracted call name: '{call_name}'")
 
             # Use Java-specific resolution for Java method calls
             if language == "java" and call_node.type == "method_invocation":

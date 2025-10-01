@@ -709,155 +709,572 @@ class JavaTypeInferenceEngine:
         Returns:
             Tuple of (method_type, method_qualified_name) or None if not resolvable
         """
+        call_text = call_node.text.decode("utf8") if call_node.text else "unknown"
+        logger.info(
+            f"☕ Resolving Java method call: '{call_text}' in module: '{module_qn}'"
+        )
+
         if call_node.type != "method_invocation":
+            logger.warning(f"❌ Expected method_invocation node, got: {call_node.type}")
             return None
 
         call_info = extract_java_method_call_info(call_node)
         method_name = call_info.get("name")
         object_ref = call_info.get("object")
 
-        if not method_name:
-            logger.debug("No method name found in call node")
-            return None
-
         logger.debug(
-            f"Resolving Java method call: method={method_name}, object={object_ref}"
+            f"📋 Extracted call info - method: '{method_name}', object: '{object_ref}'"
         )
+
+        if not method_name:
+            logger.warning("❌ No method name found in call node")
+            return None
 
         # Case 1: Static method call or call without object (e.g., "method()" or "Class.method()")
         if not object_ref:
-            logger.debug(f"Resolving static/local method: {method_name}")
+            logger.info(f"🔍 Resolving static/local method: '{method_name}'")
+            logger.debug(
+                f"📊 Available local variables: {list(local_var_types.keys())}"
+            )
             result = self._resolve_static_or_local_method(str(method_name), module_qn)
             if result:
-                logger.debug(f"Found static/local method: {result}")
+                logger.info(f"✅ Found static/local method: {result}")
             else:
-                logger.debug(f"Static/local method not found: {method_name}")
+                logger.warning(f"❌ Static/local method not found: '{method_name}'")
             return result
 
         # Case 2: Instance method call (e.g., "obj.method()")
         # First, determine the type of the object
-        logger.debug(f"Resolving object type for: {object_ref}")
+        logger.info(f"🔍 Resolving object type for: '{object_ref}'")
+        logger.debug(f"📊 Available local variables: {list(local_var_types.keys())}")
+
         object_type = self._resolve_java_object_type(
             str(object_ref), local_var_types, module_qn
         )
         if not object_type:
-            logger.debug(f"Could not determine type of object: {object_ref}")
+            logger.warning(f"❌ Could not determine type of object: '{object_ref}'")
+            logger.debug(f"📊 Local variables available: {local_var_types}")
+            logger.debug(f"📊 Module: '{module_qn}'")
             return None
 
-        logger.debug(f"Object type resolved to: {object_type}")
+        logger.info(f"✅ Object type resolved to: '{object_type}'")
         # Now find the method in the object's class
         result = self._resolve_instance_method(object_type, str(method_name), module_qn)
         if result:
-            logger.debug(f"Found instance method: {result}")
+            logger.info(f"✅ Found instance method: {result}")
         else:
-            logger.debug(f"Instance method not found: {object_type}.{method_name}")
+            logger.warning(
+                f"❌ Instance method not found: '{object_type}.{method_name}'"
+            )
         return result
 
     def _resolve_java_object_type(
         self, object_ref: str, local_var_types: dict[str, str], module_qn: str
     ) -> str | None:
         """Resolve the type of a Java object reference using tree-sitter analysis."""
+        logger.debug(
+            f"🔍 Resolving Java object type for: '{object_ref}' in module: '{module_qn}'"
+        )
+        logger.debug(f"📊 Available local variables: {list(local_var_types.keys())}")
+
         # Check if it's a local variable
         if object_ref in local_var_types:
-            return local_var_types[object_ref]
+            result = local_var_types[object_ref]
+            logger.debug(f"✅ Found as local variable: '{object_ref}' -> '{result}'")
+            return result
 
         # Check for 'this' reference - find the containing class
         if object_ref == "this":
+            logger.debug(f"🔍 Processing 'this' reference in module: '{module_qn}'")
+            logger.debug(
+                f"📊 Function registry contains {len(self.function_registry)} entries"
+            )
+
             # Look for any class in the current module (simplified)
+            matching_classes = []
             for qn, entity_type in self.function_registry.items():
                 if entity_type == "Class" and qn.startswith(module_qn + "."):
-                    return str(qn)
-            return None
+                    matching_classes.append(qn)
+                    logger.debug(
+                        f"📋 Found matching class: '{qn}' (type: {entity_type})"
+                    )
+
+            if matching_classes:
+                # If multiple classes, prefer the one that matches the module name exactly
+                for qn in matching_classes:
+                    if qn == module_qn or qn.startswith(module_qn + "."):
+                        logger.debug(f"✅ Selected 'this' class: '{qn}'")
+                        return str(qn)
+                # Fallback to first match
+                result = str(matching_classes[0])
+                logger.debug(f"✅ Fallback 'this' class: '{result}'")
+                return result
+            else:
+                logger.warning(
+                    f"❌ No classes found in module '{module_qn}' for 'this' reference"
+                )
+                return None
 
         # Check for 'super' reference
         if object_ref == "super":
+            logger.debug(f"🔍 Processing 'super' reference in module: '{module_qn}'")
+
             # For super calls, we need to look at parent classes
             # This is a simplified implementation
+            matching_classes = []
             for qn, entity_type in self.function_registry.items():
                 if entity_type == "Class" and qn.startswith(module_qn + "."):
-                    # Look for parent classes - simplified approach
-                    parent_qn = self._find_parent_class(qn)
-                    if parent_qn:
-                        return parent_qn
+                    matching_classes.append(qn)
+                    logger.debug(f"📋 Found class for super lookup: '{qn}'")
+
+            for qn in matching_classes:
+                # Look for parent classes - simplified approach
+                parent_qn = self._find_parent_class(qn)
+                if parent_qn:
+                    logger.debug(f"✅ Found super class: '{qn}' -> '{parent_qn}'")
+                    return parent_qn
+                else:
+                    logger.debug(f"⚠️ No parent class found for: '{qn}'")
+
+            logger.warning(
+                f"❌ No super class found for any class in module '{module_qn}'"
+            )
             return None
 
         # Check if it's a static class reference
         if module_qn in self.import_processor.import_mapping:
             import_map = self.import_processor.import_mapping[module_qn]
-            if object_ref in import_map:
-                return import_map[object_ref]
+            logger.debug(
+                f"📦 Import map for module '{module_qn}': {list(import_map.keys())}"
+            )
 
-        # Check if it's a simple class name in the same module
+            if object_ref in import_map:
+                result = import_map[object_ref]
+                logger.debug(
+                    f"✅ Found as imported class: '{object_ref}' -> '{result}'"
+                )
+                return result
+        else:
+            logger.debug(f"⚠️ No import mapping found for module: '{module_qn}'")
+
+        # Check if it's a simple class name in the same package
+        # First, try to find the actual package name from the module_qn
+        package_name = self._extract_java_package_name(module_qn)
+        if package_name:
+            same_package_class_qn = f"{package_name}.{object_ref}"
+            logger.debug(f"🔍 Checking same package class: '{same_package_class_qn}'")
+
+            if (
+                same_package_class_qn in self.function_registry
+                and self.function_registry[same_package_class_qn] == "Class"
+            ):
+                logger.debug(
+                    f"✅ Found as same package class: '{same_package_class_qn}'"
+                )
+                return same_package_class_qn
+            else:
+                logger.debug(
+                    f"📊 Function registry entries starting with '{same_package_class_qn}':"
+                )
+                for qn, entity_type in self.function_registry.items():
+                    if qn.startswith(same_package_class_qn):
+                        logger.debug(f"  - {qn} ({entity_type})")
+
+        # Fallback: try to extract package from module_qn by removing the filename
+        # module_qn format: "project.src.main.java.com.alibaba.havana.demo.diamond.DiamondController"
+        # We need: "project.src.main.java.com.alibaba.havana.demo.diamond" (remove filename)
+        fallback_package = self._extract_package_from_module_qn(module_qn)
+        if fallback_package:
+            fallback_class_qn = f"{fallback_package}.{object_ref}"
+            logger.debug(f"🔍 Checking fallback package class: '{fallback_class_qn}'")
+
+            if (
+                fallback_class_qn in self.function_registry
+                and self.function_registry[fallback_class_qn] == "Class"
+            ):
+                logger.debug(
+                    f"✅ Found as fallback package class: '{fallback_class_qn}'"
+                )
+                return fallback_class_qn
+            else:
+                logger.debug(
+                    f"❌ Fallback package class '{fallback_class_qn}' not found in function registry"
+                )
+                logger.debug(
+                    f"📊 Function registry entries starting with '{fallback_class_qn}':"
+                )
+                for qn, entity_type in self.function_registry.items():
+                    if qn.startswith(fallback_class_qn):
+                        logger.debug(f"  - {qn} ({entity_type})")
+
+        # Last resort: try with module_qn directly (for cases where module_qn is the package)
         simple_class_qn = f"{module_qn}.{object_ref}"
+        logger.debug(f"🔍 Checking simple class name: '{simple_class_qn}'")
+
         if (
             simple_class_qn in self.function_registry
             and self.function_registry[simple_class_qn] == "Class"
         ):
+            logger.debug(f"✅ Found as simple class: '{simple_class_qn}'")
             return simple_class_qn
+        else:
+            logger.debug(
+                f"❌ Simple class '{simple_class_qn}' not found in function registry"
+            )
+
+        # Additional debugging: show what's available in function registry
+        logger.debug(f"📊 Function registry entries starting with '{module_qn}':")
+        for qn, entity_type in self.function_registry.items():
+            if qn.startswith(module_qn):
+                logger.debug(f"  - {qn} ({entity_type})")
+
+        logger.warning(
+            f"❌ Could not resolve object type for: '{object_ref}' in module: '{module_qn}'"
+        )
+        return None
+
+    def _extract_java_package_name(self, module_qn: str) -> str | None:
+        """Extract the actual Java package name from module_qn.
+
+        Java module_qn is constructed from file path like:
+        project.src.main.java.com.example.MyClass -> com.example
+
+        Args:
+            module_qn: The module qualified name (file path based)
+
+        Returns:
+            The actual Java package name, or None if not found
+        """
+        # Get the AST for the module to find the package declaration
+        file_path = self.module_qn_to_file_path.get(module_qn)
+        if file_path is None or file_path not in self.ast_cache:
+            return None
+
+        root_node, _ = self.ast_cache[file_path]
+
+        # Look for package declaration in the AST
+        package_name = self._find_package_declaration(root_node)
+        if package_name:
+            return package_name
+
+        # Fallback: try to extract package from module_qn path
+        # For Java files, the package is usually after 'java' in the path
+        parts = module_qn.split(".")
+        try:
+            java_index = parts.index("java")
+            if java_index + 1 < len(parts):
+                # Extract package parts after 'java'
+                package_parts = parts[java_index + 1 :]
+                # Remove the filename (last part) to get package
+                if len(package_parts) > 1:
+                    package_parts = package_parts[:-1]  # Remove filename
+                    if package_parts:  # Only return if there are package parts
+                        return ".".join(package_parts)
+        except ValueError:
+            # 'java' not found in path, try other patterns
+            pass
+
+        return None
+
+    def _find_package_declaration(self, root_node: Node) -> str | None:
+        """Find package declaration in Java AST."""
+        for child in root_node.children:
+            if child.type == "package_declaration":
+                # Extract package name from package declaration
+                package_name = self._extract_package_name_from_declaration(child)
+                if package_name:
+                    return package_name
+        return None
+
+    def _extract_package_name_from_declaration(self, package_node: Node) -> str | None:
+        """Extract package name from package declaration node."""
+        # Look for scoped_identifier or identifier nodes in package declaration
+        for child in package_node.children:
+            if child.type in ["scoped_identifier", "identifier"]:
+                return safe_decode_text(child)
+        return None
+
+    def _extract_package_from_module_qn(self, module_qn: str) -> str | None:
+        """Extract package name from module_qn by removing the filename.
+
+        Args:
+            module_qn: The module qualified name like "project.src.main.java.com.alibaba.havana.demo.diamond.DiamondController"
+
+        Returns:
+            The package name like "project.src.main.java.com.alibaba.havana.demo.diamond" (filename removed)
+        """
+        if not module_qn:
+            return None
+
+        # Split the module_qn into parts
+        parts = module_qn.split(".")
+        if len(parts) < 2:
+            return None
+
+        # Remove the last part (filename) to get the package
+        package_parts = parts[:-1]
+        if package_parts:
+            return ".".join(package_parts)
 
         return None
 
     def _find_parent_class(self, class_qn: str) -> str | None:
         """Find the parent class of a given class using actual inheritance data."""
+        logger.debug(f"🔍 Looking for parent class of: '{class_qn}'")
+        logger.debug(
+            f"📊 Class inheritance data contains {len(self.class_inheritance)} classes"
+        )
+
         # Look up the parent class from the parsed inheritance information
         parent_classes = self.class_inheritance.get(class_qn, [])
+        logger.debug(f"📋 Parent classes for '{class_qn}': {parent_classes}")
 
         # Return the first parent class if any exists
         # In Java, there's only one direct superclass due to single inheritance
         if parent_classes:
-            return parent_classes[0]
-
-        return None
+            result = parent_classes[0]
+            logger.debug(f"✅ Found parent class: '{class_qn}' -> '{result}'")
+            return result
+        else:
+            logger.debug(f"❌ No parent classes found for: '{class_qn}'")
+            return None
 
     def _resolve_static_or_local_method(
         self, method_name: str, module_qn: str
     ) -> tuple[str, str] | None:
         """Resolve a static method call or local method call using tree-sitter."""
+        logger.debug(
+            f"🔍 Resolving static/local method: '{method_name}' in module: '{module_qn}'"
+        )
+        logger.debug(
+            f"📊 Function registry contains {len(self.function_registry)} entries"
+        )
+
         # Search for methods in the current module that match the method name
+        matching_methods = []
         for qn, entity_type in self.function_registry.items():
             if (
                 qn.startswith(f"{module_qn}.")
                 and entity_type in ["Method", "Constructor"]
                 and qn.split("(")[0].endswith(f".{method_name}")
             ):
-                return entity_type, qn
+                matching_methods.append((entity_type, qn))
+                logger.debug(
+                    f"📋 Found matching static/local method: {qn} ({entity_type})"
+                )
 
-        return None
+        if matching_methods:
+            result = matching_methods[0]
+            logger.debug(f"✅ Selected static/local method: {result}")
+            return result
+        else:
+            logger.debug(
+                f"❌ No static/local methods found for '{method_name}' in module '{module_qn}'"
+            )
+            logger.debug(f"📊 Available methods in module '{module_qn}':")
+            for qn, entity_type in self.function_registry.items():
+                if qn.startswith(f"{module_qn}.") and entity_type in [
+                    "Method",
+                    "Constructor",
+                ]:
+                    logger.debug(f"  - {qn} ({entity_type})")
+            return None
 
     def _resolve_instance_method(
         self, object_type: str, method_name: str, module_qn: str
     ) -> tuple[str, str] | None:
         """Resolve an instance method call on a specific object type using tree-sitter."""
+        logger.info(
+            f"🔍 Resolving instance method: '{object_type}.{method_name}' in module: '{module_qn}'"
+        )
+
         # Resolve object_type to fully qualified name
+        logger.debug(
+            f"📝 Step 1: Resolving object type '{object_type}' to fully qualified name"
+        )
         resolved_type = self._resolve_java_type_name(object_type, module_qn)
+        logger.debug(f"✅ Resolved object type: '{object_type}' -> '{resolved_type}'")
+
+        if not resolved_type:
+            logger.warning(f"❌ Failed to resolve object type: '{object_type}'")
+            return None
 
         # Look for the method in the class using flexible signature matching
+        logger.debug(
+            f"📝 Step 2: Looking for method '{method_name}' in class '{resolved_type}'"
+        )
         method_result = self._find_method_with_any_signature(resolved_type, method_name)
         if method_result:
+            logger.info(
+                f"✅ Found method in class: '{resolved_type}.{method_name}' -> {method_result}"
+            )
             return method_result
+        else:
+            logger.debug(
+                f"❌ Method '{method_name}' not found in class '{resolved_type}'"
+            )
 
         # Check inheritance hierarchy and interface implementations using tree-sitter navigation
+        logger.debug(
+            f"📝 Step 3: Checking inheritance hierarchy for method '{method_name}'"
+        )
         inherited_result = self._find_inherited_method(
             resolved_type, method_name, module_qn
         )
         if inherited_result:
+            logger.info(
+                f"✅ Found inherited method: '{resolved_type}.{method_name}' -> {inherited_result}"
+            )
             return inherited_result
+        else:
+            logger.debug(
+                f"❌ Method '{method_name}' not found in inheritance hierarchy"
+            )
 
         # Also check interface implementations
-        return self._find_interface_method(resolved_type, method_name, module_qn)
+        logger.debug(
+            f"📝 Step 4: Checking interface implementations for method '{method_name}'"
+        )
+        interface_result = self._find_interface_method(
+            resolved_type, method_name, module_qn
+        )
+        if interface_result:
+            logger.info(
+                f"✅ Found interface method: '{resolved_type}.{method_name}' -> {interface_result}"
+            )
+            return interface_result
+        else:
+            logger.debug(
+                f"❌ Method '{method_name}' not found in interface implementations"
+            )
+
+        logger.warning(
+            f"❌ Could not resolve instance method: '{resolved_type}.{method_name}'"
+        )
+        logger.debug(f"📊 Function registry entries for '{resolved_type}':")
+        for qn, entity_type in self.function_registry.items():
+            if qn.startswith(resolved_type):
+                logger.debug(f"  - {qn} ({entity_type})")
+
+        return None
 
     def _find_method_with_any_signature(
         self, class_qn: str, method_name: str
     ) -> tuple[str, str] | None:
         """Find a method with any parameter signature using function registry."""
+        logger.debug(f"🔍 Searching for method '{method_name}' in class '{class_qn}'")
+        logger.debug(
+            f"📊 Function registry contains {len(self.function_registry)} entries"
+        )
+
         # Search through all registered methods for this class and method name
+        target_pattern = f"{class_qn}.{method_name}"
+        logger.debug(f"📝 Looking for pattern: '{target_pattern}'")
+
+        matching_methods = []
         for qn, method_type in self.function_registry.items():
-            if qn.startswith(f"{class_qn}.{method_name}"):
-                # Check if this matches the method pattern (either bare name or with parameters)
-                remaining = qn[len(f"{class_qn}.{method_name}") :]
-                if remaining == "" or remaining.startswith("("):
-                    return method_type, qn
-        return None
+            # Use contains to find methods that include the method name
+            if (
+                class_qn in qn
+                and method_name in qn
+                and method_type in ["Method", "Constructor"]
+            ):
+                logger.debug(f"📋 Found potential match: '{qn}' (type: {method_type})")
+
+                # Handle format: package.Class.Class.method(params)
+                # Extract the simple class name from the full qualified name
+                simple_class_name = class_qn.split(".")[-1]
+                logger.debug(f"    Simple class name: '{simple_class_name}'")
+
+                # Look for pattern: class_qn.simple_class_name.method_name
+                expected_pattern = f"{class_qn}.{simple_class_name}.{method_name}"
+                logger.debug(f"    Expected pattern: '{expected_pattern}'")
+
+                if qn.startswith(expected_pattern):
+                    # Extract the part after method name
+                    after_method = qn[len(expected_pattern) :]
+                    logger.debug(f"    After method name: '{after_method}'")
+
+                    # Valid if it's empty or starts with ( or <
+                    if (
+                        after_method == ""
+                        or after_method.startswith("(")
+                        or after_method.startswith("<")
+                    ):
+                        matching_methods.append((method_type, qn))
+                        logger.debug(
+                            f"✅ Valid method match: '{qn}' (type: {method_type})"
+                        )
+                    else:
+                        logger.debug(
+                            f"❌ Invalid pattern - after method '{after_method}' doesn't start with '(' or '<'"
+                        )
+                else:
+                    # Fallback: try to find method name after any occurrence of simple class name
+                    simple_class_pattern = f".{simple_class_name}.{method_name}"
+                    logger.debug(f"    Fallback pattern: '{simple_class_pattern}'")
+
+                    if simple_class_pattern in qn:
+                        # Find the position of this pattern
+                        pattern_index = qn.find(simple_class_pattern)
+                        after_method = qn[pattern_index + len(simple_class_pattern) :]
+                        logger.debug(
+                            f"    Fallback - after method name: '{after_method}'"
+                        )
+
+                        if (
+                            after_method == ""
+                            or after_method.startswith("(")
+                            or after_method.startswith("<")
+                        ):
+                            matching_methods.append((method_type, qn))
+                            logger.debug(
+                                f"✅ Valid fallback match: '{qn}' (type: {method_type})"
+                            )
+                        else:
+                            logger.debug(
+                                f"❌ Invalid fallback pattern - after method '{after_method}' doesn't start with '(' or '<'"
+                            )
+                    else:
+                        logger.debug(
+                            f"❌ Neither primary nor fallback pattern found in '{qn}'"
+                        )
+
+        if matching_methods:
+            result = matching_methods[0]
+            logger.debug(f"✅ Selected method: {result}")
+            logger.debug(f"📊 Total matches found: {len(matching_methods)}")
+            return result
+        else:
+            logger.debug(f"❌ No methods found for '{class_qn}.{method_name}'")
+
+            # Show all methods for this class
+            logger.debug(f"📊 Available methods for class '{class_qn}':")
+            class_methods = []
+            for qn, entity_type in self.function_registry.items():
+                if qn.startswith(class_qn) and entity_type in ["Method", "Constructor"]:
+                    class_methods.append(f"{qn} ({entity_type})")
+
+            if class_methods:
+                for method in class_methods:
+                    logger.debug(f"  - {method}")
+            else:
+                logger.debug(f"  No methods found for class '{class_qn}'")
+
+            # Show all methods containing the method name
+            logger.debug(f"📊 All methods containing '{method_name}':")
+            name_matches = []
+            for qn, entity_type in self.function_registry.items():
+                if method_name in qn and entity_type in ["Method", "Constructor"]:
+                    name_matches.append(f"{qn} ({entity_type})")
+
+            if name_matches:
+                for match in name_matches:
+                    logger.debug(f"  - {match}")
+            else:
+                logger.debug(f"  No methods found containing '{method_name}'")
+
+            return None
 
     def _find_inherited_method(
         self, class_qn: str, method_name: str, module_qn: str
