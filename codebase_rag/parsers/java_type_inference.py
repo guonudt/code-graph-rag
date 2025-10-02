@@ -936,45 +936,26 @@ class JavaTypeInferenceEngine:
     def _extract_java_package_name(self, module_qn: str) -> str | None:
         """Extract the actual Java package name from module_qn.
 
-        Java module_qn is constructed from file path like:
-        project.src.main.java.com.example.MyClass -> com.example
+        With the new design, module_qn format is: project_name.module_name.src.main.java.package_name.class_name
+        We need to extract the package part (everything except the last part which is class_name).
 
         Args:
-            module_qn: The module qualified name (file path based)
+            module_qn: The module qualified name (format: project_name.module_name.src.main.java.package_name.class_name)
 
         Returns:
-            The actual Java package name, or None if not found
+            The Java package name (project_name.module_name.src.main.java.package_name)
         """
-        # Get the AST for the module to find the package declaration
-        file_path = self.module_qn_to_file_path.get(module_qn)
-        if file_path is None or file_path not in self.ast_cache:
+        if not module_qn:
             return None
 
-        root_node, _ = self.ast_cache[file_path]
-
-        # Look for package declaration in the AST
-        package_name = self._find_package_declaration(root_node)
-        if package_name:
-            return package_name
-
-        # Fallback: try to extract package from module_qn path
-        # For Java files, the package is usually after 'java' in the path
+        # Split the module_qn and remove the last part (class name) to get package
         parts = module_qn.split(".")
-        try:
-            java_index = parts.index("java")
-            if java_index + 1 < len(parts):
-                # Extract package parts after 'java'
-                package_parts = parts[java_index + 1 :]
-                # Remove the filename (last part) to get package
-                if len(package_parts) > 1:
-                    package_parts = package_parts[:-1]  # Remove filename
-                    if package_parts:  # Only return if there are package parts
-                        return ".".join(package_parts)
-        except ValueError:
-            # 'java' not found in path, try other patterns
-            pass
+        if len(parts) < 2:
+            return None
 
-        return None
+        # Remove the last part (class name) to get package
+        package_parts = parts[:-1]
+        return ".".join(package_parts)
 
     def _find_package_declaration(self, root_node: Node) -> str | None:
         """Find package declaration in Java AST."""
@@ -995,28 +976,28 @@ class JavaTypeInferenceEngine:
         return None
 
     def _extract_package_from_module_qn(self, module_qn: str) -> str | None:
-        """Extract package name from module_qn by removing the filename.
+        """Extract package name from module_qn.
+
+        With the new design, module_qn format is: project_name.module_name.src.main.java.package_name.class_name
+        We need to extract the package part (everything except the last part which is class_name).
 
         Args:
-            module_qn: The module qualified name like "project.src.main.java.com.alibaba.havana.demo.diamond.DiamondController"
+            module_qn: The module qualified name (format: project_name.module_name.src.main.java.package_name.class_name)
 
         Returns:
-            The package name like "project.src.main.java.com.alibaba.havana.demo.diamond" (filename removed)
+            The package name (project_name.module_name.src.main.java.package_name)
         """
         if not module_qn:
             return None
 
-        # Split the module_qn into parts
+        # Split the module_qn and remove the last part (class name) to get package
         parts = module_qn.split(".")
         if len(parts) < 2:
             return None
 
-        # Remove the last part (filename) to get the package
+        # Remove the last part (class name) to get package
         package_parts = parts[:-1]
-        if package_parts:
-            return ".".join(package_parts)
-
-        return None
+        return ".".join(package_parts)
 
     def _find_parent_class(self, class_qn: str) -> str | None:
         """Find the parent class of a given class using actual inheritance data."""

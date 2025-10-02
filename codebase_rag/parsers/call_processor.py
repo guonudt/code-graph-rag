@@ -104,6 +104,128 @@ class CallProcessor:
         self.type_inference = type_inference
         self.class_inheritance = class_inheritance
 
+    def _build_java_module_qn(self, file_path: Path, relative_path: Path) -> str:
+        """Build module_qn for Java files by concatenating project_name and relative_path.
+
+        For Java files, module_qn should be the same as class_qn since each file
+        typically contains one public class with the same name as the file.
+
+        Format: project_name.relative_path_without_extension
+
+        Args:
+            file_path: The Java file path
+            relative_path: The relative path from repo root
+
+        Returns:
+            The module qualified name (same as class qualified name) for the Java file
+        """
+        # Remove file extension and convert path parts to dot-separated string
+        path_without_extension = relative_path.with_suffix("")
+        path_parts = list(path_without_extension.parts)
+
+        # Concatenate project_name with relative path parts
+        full_parts = [self.project_name] + path_parts
+        full_module_qn = ".".join(full_parts)
+
+        # Debug logging
+        logger.debug("Java module_qn construction:")
+        logger.debug(f"  project_name: {self.project_name}")
+        logger.debug(f"  relative_path: {relative_path}")
+        logger.debug(f"  path_without_extension: {path_without_extension}")
+        logger.debug(f"  path_parts: {path_parts}")
+        logger.debug(f"  constructed module_qn: {full_module_qn}")
+
+        return full_module_qn
+
+    def _extract_java_package_from_ast(self, file_path: Path) -> str | None:
+        """Extract Java package name from AST.
+
+        Args:
+            file_path: The Java file path
+
+        Returns:
+            The package name if found, None otherwise
+        """
+        try:
+            source_bytes = file_path.read_bytes()
+            source_text = source_bytes.decode("utf-8")
+
+            # Look for package declaration
+            lines = source_text.split("\n")
+            for line in lines:
+                line = line.strip()
+                if line.startswith("package "):
+                    # Extract package name
+                    package_line = line[8:]  # Remove 'package '
+                    # Remove semicolon and comments
+                    package_line = package_line.split(";")[0].split("//")[0].strip()
+                    if package_line:
+                        return package_line
+        except Exception as e:
+            logger.debug(f"Failed to extract package from source for {file_path}: {e}")
+
+        return None
+
+    def _extract_java_module_name(
+        self, file_path: Path, relative_path: Path
+    ) -> str | None:
+        """Extract Java module name from file path.
+
+        For Java projects, the module name is typically found in the path structure.
+        Common patterns:
+        - src/main/java/com/example/ModuleName/...
+        - hellodemo-start/src/main/java/...
+        - hellodemo-service/src/main/java/...
+        - hellodemo-core/src/main/java/...
+        - hellodemo-main/src/main/java/...
+
+        Args:
+            file_path: The Java file path
+            relative_path: The relative path from repo root
+
+        Returns:
+            The Java module name if found, None otherwise
+        """
+        try:
+            parts = list(relative_path.parts)
+
+            # Look for common module name patterns
+            # Pattern 1: Check if the first part looks like a module name (contains hyphen and followed by src)
+            if len(parts) >= 4 and parts[1] == "src":
+                first_part = parts[0]
+                # Check if it looks like a module name (contains hyphen, which is common in multi-module projects)
+                if "-" in first_part and not first_part.startswith(
+                    ("com.", "org.", "net.", "java.", "javax.")
+                ):
+                    # Special case: if the directory name contains the project name, extract the module part
+                    if first_part.startswith(f"{self.project_name}-"):
+                        # Extract module name by removing project name prefix
+                        module_name = first_part[len(f"{self.project_name}-") :]
+                        return module_name
+                    else:
+                        return first_part
+
+            # Pattern 2: Check if there's a module name in the project structure
+            # Look for directories that might contain module information
+            if file_path.exists():
+                # Try to find module information from the file system
+                current_path = file_path.parent
+                while (
+                    current_path != self.repo_path
+                    and current_path.parent != current_path
+                ):
+                    # Check if this directory looks like a module (contains hyphen)
+                    if "-" in current_path.name and not current_path.name.startswith(
+                        ("com.", "org.", "net.", "java.", "javax.")
+                    ):
+                        return current_path.name
+                    current_path = current_path.parent
+
+        except Exception as e:
+            logger.debug(f"Failed to extract module name from {file_path}: {e}")
+
+        return None
+
     def process_calls_in_file(
         self, file_path: Path, root_node: Node, language: str, queries: dict[str, Any]
     ) -> None:
@@ -112,13 +234,17 @@ class CallProcessor:
         logger.debug(f"Processing calls in cached AST for: {relative_path}")
 
         try:
-            module_qn = ".".join(
-                [self.project_name] + list(relative_path.with_suffix("").parts)
-            )
-            if file_path.name == "__init__.py":
+            # Construct module_qn based on language
+            if language == "java":
+                module_qn = self._build_java_module_qn(file_path, relative_path)
+            else:
                 module_qn = ".".join(
-                    [self.project_name] + list(relative_path.parent.parts)
+                    [self.project_name] + list(relative_path.with_suffix("").parts)
                 )
+                if file_path.name == "__init__.py":
+                    module_qn = ".".join(
+                        [self.project_name] + list(relative_path.parent.parts)
+                    )
 
             self._process_calls_in_functions(root_node, module_qn, language, queries)
             self._process_calls_in_classes(root_node, module_qn, language, queries)
@@ -208,7 +334,8 @@ class CallProcessor:
 
             class_name = text.decode("utf8")
             class_qn = f"{module_qn}.{class_name}"
-
+            if language == "java":
+                class_qn = module_qn
             logger.debug(
                 f"🏗️ Processing class {i}/{len(class_nodes)}: '{class_name}' (qn: '{class_qn}')"
             )
@@ -269,8 +396,11 @@ class CallProcessor:
         self, root_node: Node, module_qn: str, language: str, queries: dict[str, Any]
     ) -> None:
         """Process top-level calls in the module (like IIFE calls)."""
+        # Print current Node information
+        node_info = f" (Node: {root_node.type}, start: {root_node.start_point}, end: {root_node.end_point})"
+
         logger.debug(
-            f"🔍 Processing calls for module level: '{module_qn}' (language: {language})"
+            f"🔍 Processing calls for module level: '{module_qn}' (language: {language}){node_info}"
         )
 
         # For Java, we need to exclude call nodes that are already inside methods/functions
@@ -289,6 +419,9 @@ class CallProcessor:
         self, root_node: Node, module_qn: str, language: str, queries: dict[str, Any]
     ) -> None:
         """Process module-level calls excluding those already inside methods/functions."""
+        # Print current Node information
+        node_info = f" (Node: {root_node.type}, start: {root_node.start_point}, end: {root_node.end_point})"
+
         calls_query = queries[language].get("calls")
         if not calls_query:
             return
@@ -310,7 +443,7 @@ class CallProcessor:
 
         logger.debug(
             f"Found {len(module_level_call_nodes)} module-level call nodes "
-            f"(filtered from {len(all_call_nodes)} total call nodes)"
+            f"(filtered from {len(all_call_nodes)} total call nodes){node_info}"
         )
 
         # Process the filtered call nodes
@@ -323,7 +456,7 @@ class CallProcessor:
             call_type = call_node.type
 
             logger.debug(
-                f"📞 Processing module-level call node {i}/{len(module_level_call_nodes)}: '{call_text}' (type: {call_type})"
+                f"📞 Processing module-level call node {i}/{len(module_level_call_nodes)}: '{call_text}' (type: {call_type}){node_info}"
             )
 
             # Process nested calls first (inner to outer)

@@ -90,9 +90,10 @@ class StructureProcessor:
             elif root != self.repo_path:
                 self.structural_elements[relative_root] = None  # Mark as folder
                 logger.info(f"  Identified Folder: '{relative_root}'")
-                self.ingestor.ensure_node_batch(
-                    "Folder", {"path": str(relative_root), "name": root.name}
-                )
+                # Skip Folder node creation - no longer creating Folder nodes
+                # self.ingestor.ensure_node_batch(
+                #     "Folder", {"path": str(relative_root), "name": root.name}
+                # )
                 parent_label, parent_key, parent_val = (
                     ("Project", "name", self.project_name)
                     if parent_rel_path == Path(".")
@@ -102,15 +103,15 @@ class StructureProcessor:
                         else ("Folder", "path", str(parent_rel_path))
                     )
                 )
-                self.ingestor.ensure_relationship_batch(
-                    (parent_label, parent_key, parent_val),
-                    "CONTAINS_FOLDER",
-                    ("Folder", "path", str(relative_root)),
-                )
+                # Skip CONTAINS_FOLDER relationship - no longer building this relationship type
+                # self.ingestor.ensure_relationship_batch(
+                #     (parent_label, parent_key, parent_val),
+                #     "CONTAINS_FOLDER",
+                #     ("Folder", "path", str(relative_root)),
+                # )
 
     def process_generic_file(self, file_path: Path, file_name: str) -> None:
         """Process a generic (non-parseable) file and create appropriate nodes/relationships."""
-        relative_filepath = str(file_path.relative_to(self.repo_path))
         relative_root = file_path.parent.relative_to(self.repo_path)
 
         # Determine the parent container
@@ -125,19 +126,19 @@ class StructureProcessor:
             )
         )
 
-        # Create File node
-        self.ingestor.ensure_node_batch(
-            "File",
-            {
-                "path": relative_filepath,
-                "name": file_name,
-                "extension": file_path.suffix,
-            },
-        )
+        # Skip File node creation - no longer creating File nodes
+        # self.ingestor.ensure_node_batch(
+        #     "File",
+        #     {
+        #         "path": relative_filepath,
+        #         "name": file_name,
+        #         "extension": file_path.suffix,
+        #     },
+        # )
 
-        # Create relationship to parent container
-        self.ingestor.ensure_relationship_batch(
-            (parent_label, parent_key, parent_val),
-            "CONTAINS_FILE",
-            ("File", "path", relative_filepath),
-        )
+        # Skip CONTAINS_FILE relationship - no longer building this relationship type
+        # self.ingestor.ensure_relationship_batch(
+        #     (parent_label, parent_key, parent_val),
+        #     "CONTAINS_FILE",
+        #     ("File", "path", relative_filepath),
+        # )

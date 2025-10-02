@@ -55,6 +55,149 @@ class DefinitionProcessor:
         self.module_qn_to_file_path = module_qn_to_file_path
         self.class_inheritance: dict[str, list[str]] = {}
 
+    def _build_java_module_qn(self, file_path: Path, relative_path: Path) -> str:
+        """Build module_qn for Java files by concatenating project_name and relative_path.
+
+        For Java files, module_qn should be the same as class_qn since each file
+        typically contains one public class with the same name as the file.
+
+        Format: project_name.relative_path_without_extension
+
+        Args:
+            file_path: The Java file path
+            relative_path: The relative path from repo root
+
+        Returns:
+            The module qualified name (same as class qualified name) for the Java file
+        """
+        # Remove file extension and convert path parts to dot-separated string
+        path_without_extension = relative_path.with_suffix("")
+        path_parts = list(path_without_extension.parts)
+
+        # Concatenate project_name with relative path parts
+        full_parts = [self.project_name] + path_parts
+        full_module_qn = ".".join(full_parts)
+
+        # Debug logging
+        logger.debug("Java module_qn construction:")
+        logger.debug(f"  project_name: {self.project_name}")
+        logger.debug(f"  relative_path: {relative_path}")
+        logger.debug(f"  path_without_extension: {path_without_extension}")
+        logger.debug(f"  path_parts: {path_parts}")
+        logger.debug(f"  constructed module_qn: {full_module_qn}")
+
+        return full_module_qn
+
+    def _extract_java_package_from_ast(self, file_path: Path) -> str | None:
+        """Extract Java package name from AST.
+
+        Args:
+            file_path: The Java file path
+
+        Returns:
+            The package name if found, None otherwise
+        """
+        try:
+            source_bytes = file_path.read_bytes()
+            # We need access to queries to get the parser
+            # For now, we'll use a simple approach and parse the source
+            source_text = source_bytes.decode("utf-8")
+
+            # Look for package declaration
+            lines = source_text.split("\n")
+            for line in lines:
+                line = line.strip()
+                if line.startswith("package "):
+                    # Extract package name
+                    package_line = line[8:]  # Remove 'package '
+                    # Remove semicolon and comments
+                    package_line = package_line.split(";")[0].split("//")[0].strip()
+                    if package_line:
+                        return package_line
+        except Exception as e:
+            logger.debug(f"Failed to extract package from source for {file_path}: {e}")
+
+        return None
+
+    def _extract_java_module_name(
+        self, file_path: Path, relative_path: Path
+    ) -> str | None:
+        """Extract Java module name from file path.
+
+        For Java projects, the module name is typically found in the path structure.
+        Common patterns:
+        - src/main/java/com/example/ModuleName/...
+        - hellodemo-start/src/main/java/...
+        - hellodemo-service/src/main/java/...
+        - hellodemo-core/src/main/java/...
+        - hellodemo-main/src/main/java/...
+
+        Args:
+            file_path: The Java file path
+            relative_path: The relative path from repo root
+
+        Returns:
+            The Java module name if found, None otherwise
+        """
+        try:
+            parts = list(relative_path.parts)
+            logger.debug(f"Extracting Java module name from path: {relative_path}")
+            logger.debug(f"  Path parts: {parts}")
+
+            # Look for common module name patterns
+            # Pattern 1: Check if the first part looks like a module name (contains hyphen and followed by src)
+            if len(parts) >= 4 and parts[1] == "src":
+                first_part = parts[0]
+                logger.debug(f"  Checking first part: {first_part}")
+                # Check if it looks like a module name (contains hyphen, which is common in multi-module projects)
+                if "-" in first_part and not first_part.startswith(
+                    ("com.", "org.", "net.", "java.", "javax.")
+                ):
+                    # Special case: if the directory name contains the project name, extract the module part
+                    if first_part.startswith(f"{self.project_name}-"):
+                        # Extract module name by removing project name prefix
+                        module_name = first_part[len(f"{self.project_name}-") :]
+                        logger.debug(
+                            f"  ✅ Extracted module name from project-prefixed directory: {module_name}"
+                        )
+                        return module_name
+                    else:
+                        logger.debug(
+                            f"  ✅ Found module name in first part: {first_part}"
+                        )
+                        return first_part
+                else:
+                    logger.debug(
+                        f"  ❌ First part doesn't look like module name: {first_part}"
+                    )
+
+            # Pattern 2: Check if there's a module name in the project structure
+            # Look for directories that might contain module information
+            if file_path.exists():
+                logger.debug("  Checking file system for module name...")
+                # Try to find module information from the file system
+                current_path = file_path.parent
+                while (
+                    current_path != self.repo_path
+                    and current_path.parent != current_path
+                ):
+                    logger.debug(f"    Checking directory: {current_path.name}")
+                    # Check if this directory looks like a module (contains hyphen)
+                    if "-" in current_path.name and not current_path.name.startswith(
+                        ("com.", "org.", "net.", "java.", "javax.")
+                    ):
+                        logger.debug(
+                            f"  ✅ Found module name in directory: {current_path.name}"
+                        )
+                        return current_path.name
+                    current_path = current_path.parent
+
+        except Exception as e:
+            logger.debug(f"Failed to extract module name from {file_path}: {e}")
+
+        logger.debug(f"  ❌ No module name found for path: {relative_path}")
+        return None
+
     def _get_node_type_for_inheritance(self, qualified_name: str) -> str:
         """
         Determine the node type for inheritance relationships.
@@ -111,18 +254,22 @@ class DefinitionProcessor:
             tree = parser.parse(source_bytes)
             root_node = tree.root_node
 
-            module_qn = ".".join(
-                [self.project_name] + list(relative_path.with_suffix("").parts)
-            )
-            if file_path.name == "__init__.py":
+            # Construct module_qn based on language
+            if language == "java":
+                module_qn = self._build_java_module_qn(file_path, relative_path)
+            else:
                 module_qn = ".".join(
-                    [self.project_name] + list(relative_path.parent.parts)
+                    [self.project_name] + list(relative_path.with_suffix("").parts)
                 )
-            elif file_path.name == "mod.rs":
-                # In Rust, mod.rs represents the parent module directory
-                module_qn = ".".join(
-                    [self.project_name] + list(relative_path.parent.parts)
-                )
+                if file_path.name == "__init__.py":
+                    module_qn = ".".join(
+                        [self.project_name] + list(relative_path.parent.parts)
+                    )
+                elif file_path.name == "mod.rs":
+                    # In Rust, mod.rs represents the parent module directory
+                    module_qn = ".".join(
+                        [self.project_name] + list(relative_path.parent.parts)
+                    )
 
             # Populate the module QN to file path mapping for efficient lookups
             self.module_qn_to_file_path[module_qn] = file_path
@@ -1058,11 +1205,16 @@ class DefinitionProcessor:
                 class_name = self._extract_class_name(class_node)
                 if not class_name:
                     continue
-                # Build nested qualified name for classes inside inline modules
-                nested_qn = self._build_nested_qualified_name_for_class(
-                    class_node, module_qn, class_name, lang_config
-                )
-                class_qn = nested_qn if nested_qn else f"{module_qn}.{class_name}"
+
+                # For Java, module_qn is already the complete class qualified name
+                if language == "java":
+                    class_qn = module_qn
+                else:
+                    # Build nested qualified name for classes inside inline modules
+                    nested_qn = self._build_nested_qualified_name_for_class(
+                        class_node, module_qn, class_name, lang_config
+                    )
+                    class_qn = nested_qn if nested_qn else f"{module_qn}.{class_name}"
             decorators = self._extract_decorators(class_node)
             class_props: dict[str, Any] = {
                 "qualified_name": class_qn,
