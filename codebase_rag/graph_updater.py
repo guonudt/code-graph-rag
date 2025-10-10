@@ -309,6 +309,12 @@ class GraphUpdater:
         logger.info("--- Pass 3: Processing Function Calls from AST Cache ---")
         self._process_function_calls()
 
+        # Process class inheritance after all classes are registered in function_registry
+        self.factory.definition_processor.process_all_class_inheritance()
+
+        # Process import relationships after all classes are registered in function_registry
+        self.factory.import_processor.process_all_imports()
+
         # Process method overrides after all definitions are collected
         self.factory.definition_processor.process_all_method_overrides()
 
@@ -317,12 +323,9 @@ class GraphUpdater:
 
     def remove_file_from_state(self, file_path: Path) -> None:
         """Removes all state associated with a file from the updater's memory."""
-        logger.debug(f"Removing in-memory state for: {file_path}")
-
         # Clear AST cache
         if file_path in self.ast_cache:
             del self.ast_cache[file_path]
-            logger.debug("  - Removed from ast_cache")
 
         # Determine the module qualified name prefix for the file
         relative_path = file_path.relative_to(self.repo_path)
@@ -344,18 +347,12 @@ class GraphUpdater:
                 qns_to_remove.add(qn)
                 del self.function_registry[qn]
 
-        if qns_to_remove:
-            logger.debug(
-                f"  - Removing {len(qns_to_remove)} QNs from function_registry"
-            )
-
         # Clean simple_name_lookup
         for simple_name, qn_set in self.simple_name_lookup.items():
             original_count = len(qn_set)
             new_qn_set = qn_set - qns_to_remove
             if len(new_qn_set) < original_count:
                 self.simple_name_lookup[simple_name] = new_qn_set
-                logger.debug(f"  - Cleaned simple_name '{simple_name}'")
 
     def _process_files(self) -> None:
         """Second pass: Efficiently processes all files, parses them, and caches their ASTs."""

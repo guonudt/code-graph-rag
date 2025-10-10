@@ -100,6 +100,9 @@ class AppConfig(BaseSettings):
         """Determines the active orchestrator model ID."""
         if self._active_orchestrator_model:
             return self._active_orchestrator_model
+        # Check if local model is configured
+        if self.LOCAL_ORCHESTRATOR_MODEL_ID and self.LOCAL_MODEL_ENDPOINT:
+            return self.LOCAL_ORCHESTRATOR_MODEL_ID
         # Default fallback to Gemini
         return self.GEMINI_MODEL_ID
 
@@ -108,6 +111,9 @@ class AppConfig(BaseSettings):
         """Determines the active cypher model ID."""
         if self._active_cypher_model:
             return self._active_cypher_model
+        # Check if local model is configured
+        if self.LOCAL_CYPHER_MODEL_ID and self.LOCAL_MODEL_ENDPOINT:
+            return self.LOCAL_CYPHER_MODEL_ID
         # Default fallback to Gemini
         return self.MODEL_CYPHER_ID
 

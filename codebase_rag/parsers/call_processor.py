@@ -127,14 +127,6 @@ class CallProcessor:
         full_parts = [self.project_name] + path_parts
         full_module_qn = ".".join(full_parts)
 
-        # Debug logging
-        logger.debug("Java module_qn construction:")
-        logger.debug(f"  project_name: {self.project_name}")
-        logger.debug(f"  relative_path: {relative_path}")
-        logger.debug(f"  path_without_extension: {path_without_extension}")
-        logger.debug(f"  path_parts: {path_parts}")
-        logger.debug(f"  constructed module_qn: {full_module_qn}")
-
         return full_module_qn
 
     def _extract_java_package_from_ast(self, file_path: Path) -> str | None:
@@ -166,72 +158,11 @@ class CallProcessor:
 
         return None
 
-    def _extract_java_module_name(
-        self, file_path: Path, relative_path: Path
-    ) -> str | None:
-        """Extract Java module name from file path.
-
-        For Java projects, the module name is typically found in the path structure.
-        Common patterns:
-        - src/main/java/com/example/ModuleName/...
-        - hellodemo-start/src/main/java/...
-        - hellodemo-service/src/main/java/...
-        - hellodemo-core/src/main/java/...
-        - hellodemo-main/src/main/java/...
-
-        Args:
-            file_path: The Java file path
-            relative_path: The relative path from repo root
-
-        Returns:
-            The Java module name if found, None otherwise
-        """
-        try:
-            parts = list(relative_path.parts)
-
-            # Look for common module name patterns
-            # Pattern 1: Check if the first part looks like a module name (contains hyphen and followed by src)
-            if len(parts) >= 4 and parts[1] == "src":
-                first_part = parts[0]
-                # Check if it looks like a module name (contains hyphen, which is common in multi-module projects)
-                if "-" in first_part and not first_part.startswith(
-                    ("com.", "org.", "net.", "java.", "javax.")
-                ):
-                    # Special case: if the directory name contains the project name, extract the module part
-                    if first_part.startswith(f"{self.project_name}-"):
-                        # Extract module name by removing project name prefix
-                        module_name = first_part[len(f"{self.project_name}-") :]
-                        return module_name
-                    else:
-                        return first_part
-
-            # Pattern 2: Check if there's a module name in the project structure
-            # Look for directories that might contain module information
-            if file_path.exists():
-                # Try to find module information from the file system
-                current_path = file_path.parent
-                while (
-                    current_path != self.repo_path
-                    and current_path.parent != current_path
-                ):
-                    # Check if this directory looks like a module (contains hyphen)
-                    if "-" in current_path.name and not current_path.name.startswith(
-                        ("com.", "org.", "net.", "java.", "javax.")
-                    ):
-                        return current_path.name
-                    current_path = current_path.parent
-
-        except Exception as e:
-            logger.debug(f"Failed to extract module name from {file_path}: {e}")
-
-        return None
-
     def process_calls_in_file(
         self, file_path: Path, root_node: Node, language: str, queries: dict[str, Any]
     ) -> None:
         """Process function calls in a specific file using its cached AST."""
         relative_path = file_path.relative_to(self.repo_path)
-        logger.debug(f"Processing calls in cached AST for: {relative_path}")
 
         try:
             # Construct module_qn based on language
@@ -246,7 +177,11 @@ class CallProcessor:
                         [self.project_name] + list(relative_path.parent.parts)
                     )
 
-            self._process_calls_in_functions(root_node, module_qn, language, queries)
+            # For Java, skip processing calls in functions since Java only has Methods (not Functions)
+            if language != "java":
+                self._process_calls_in_functions(
+                    root_node, module_qn, language, queries
+                )
             self._process_calls_in_classes(root_node, module_qn, language, queries)
             self._process_module_level_calls(root_node, module_qn, language, queries)
 
@@ -297,13 +232,8 @@ class CallProcessor:
         self, root_node: Node, module_qn: str, language: str, queries: dict[str, Any]
     ) -> None:
         """Process calls within class methods."""
-        logger.debug(
-            f"🔍 Processing calls in classes for module: '{module_qn}' (language: {language})"
-        )
-
         lang_queries = queries[language]
         if not lang_queries.get("classes"):
-            logger.debug(f"❌ No classes query found for language: {language}")
             return
 
         query = lang_queries["classes"]
@@ -311,38 +241,28 @@ class CallProcessor:
         captures = cursor.captures(root_node)
         class_nodes = captures.get("class", [])
 
-        logger.debug(f"📊 Found {len(class_nodes)} class nodes in module '{module_qn}'")
-
         if not class_nodes:
-            logger.debug(f"📭 No classes found in module '{module_qn}'")
             return
 
         for i, class_node in enumerate(class_nodes, 1):
             if not isinstance(class_node, Node):
-                logger.debug(f"⚠️ Class node {i} is not a valid Node instance")
                 continue
 
             name_node = class_node.child_by_field_name("name")
             if not name_node:
-                logger.debug(f"⚠️ Class node {i} has no name field")
                 continue
 
             text = name_node.text
             if text is None:
-                logger.debug(f"⚠️ Class node {i} name text is None")
                 continue
 
             class_name = text.decode("utf8")
             class_qn = f"{module_qn}.{class_name}"
             if language == "java":
                 class_qn = module_qn
-            logger.debug(
-                f"🏗️ Processing class {i}/{len(class_nodes)}: '{class_name}' (qn: '{class_qn}')"
-            )
 
             body_node = class_node.child_by_field_name("body")
             if not body_node:
-                logger.debug(f"⚠️ Class '{class_name}' has no body field")
                 continue
 
             method_query = lang_queries["functions"]
@@ -350,37 +270,37 @@ class CallProcessor:
             method_captures = method_cursor.captures(body_node)
             method_nodes = method_captures.get("function", [])
 
-            logger.debug(
-                f"📊 Found {len(method_nodes)} methods in class '{class_name}'"
-            )
-
             for j, method_node in enumerate(method_nodes, 1):
                 if not isinstance(method_node, Node):
-                    logger.debug(
-                        f"⚠️ Method node {j} in class '{class_name}' is not a valid Node instance"
-                    )
                     continue
 
                 method_name_node = method_node.child_by_field_name("name")
                 if not method_name_node:
-                    logger.debug(
-                        f"⚠️ Method node {j} in class '{class_name}' has no name field"
-                    )
                     continue
 
                 text = method_name_node.text
                 if text is None:
-                    logger.debug(
-                        f"⚠️ Method node {j} in class '{class_name}' name text is None"
-                    )
                     continue
 
                 method_name = text.decode("utf8")
-                method_qn = f"{class_qn}.{method_name}"
 
-                logger.debug(
-                    f"🔧 Processing method {j}/{len(method_nodes)}: '{method_name}' (qn: '{method_qn}')"
-                )
+                # For Java methods, construct qualified name with parameter types
+                method_qn = None
+                if language == "java":
+                    from .java_utils import extract_java_method_info
+
+                    method_info = extract_java_method_info(method_node)
+                    parameters = method_info.get("parameters", [])
+                    if parameters:
+                        # Create method signature with parameter types
+                        param_signature = "(" + ",".join(parameters) + ")"
+                        method_qn = f"{class_qn}.{method_name}{param_signature}"
+                    else:
+                        # No parameters, use empty parentheses
+                        method_qn = f"{class_qn}.{method_name}()"
+                else:
+                    # For non-Java methods, add () to match the registry format
+                    method_qn = f"{class_qn}.{method_name}()"
 
                 self._ingest_function_calls(
                     method_node,
@@ -392,36 +312,151 @@ class CallProcessor:
                     class_qn,
                 )
 
+            # For Java, also process class-level calls (static blocks, instance initializers)
+            # These are calls in the class body that are not inside methods
+            if language == "java":
+                self._process_class_level_calls(
+                    class_node,
+                    body_node,
+                    class_qn,
+                    module_qn,
+                    language,
+                    queries,
+                    method_nodes,
+                )
+
+    def _process_class_level_calls(
+        self,
+        class_node: Node,
+        body_node: Node,
+        class_qn: str,
+        module_qn: str,
+        language: str,
+        queries: dict[str, Any],
+        method_nodes: list[Node],
+    ) -> None:
+        """Process calls at class level (static blocks, instance initializers) for Java.
+
+        In Java, code can exist in:
+        1. Static initialization blocks: static { ... }
+        2. Instance initialization blocks: { ... }
+
+        These calls should create Class--[CALLS]-->Method relationships.
+        """
+        calls_query = queries[language].get("calls")
+        if not calls_query:
+            return
+
+        # Get all call nodes in the class body
+        cursor = QueryCursor(calls_query)
+        captures = cursor.captures(body_node)
+        all_call_nodes = captures.get("call", [])
+
+        # Filter out calls that are inside methods
+        # We need to check if each call is within any of the method nodes
+        class_level_calls = []
+        for call_node in all_call_nodes:
+            if not isinstance(call_node, Node):
+                continue
+
+            # Check if this call is inside any method
+            is_in_method = False
+            for method_node in method_nodes:
+                if not isinstance(method_node, Node):
+                    continue
+                # Check if call is within method's range
+                if (
+                    call_node.start_point >= method_node.start_point
+                    and call_node.end_point <= method_node.end_point
+                ):
+                    is_in_method = True
+                    break
+
+            if not is_in_method:
+                class_level_calls.append(call_node)
+
+        if not class_level_calls:
+            return
+
+        # Get the class node type (Class, Interface, or Enum)
+        class_type = self._get_class_type(class_node)
+
+        # Build local variable type map for the class body
+        local_var_types = self.type_inference.build_local_variable_type_map(
+            body_node, module_qn, language
+        )
+
+        # Process each class-level call
+        for i, call_node in enumerate(class_level_calls, 1):
+            # Process nested calls first
+            self._process_nested_calls_in_node(
+                call_node,
+                class_qn,
+                class_type,
+                module_qn,
+                local_var_types,
+                class_qn,
+                language,
+            )
+
+            call_name = self._get_call_target_name(call_node)
+            if not call_name:
+                continue
+
+            # Resolve the method call
+            if call_node.type == "method_invocation":
+                callee_info = self._resolve_java_method_call(
+                    call_node, module_qn, local_var_types
+                )
+            else:
+                callee_info = self._resolve_function_call(
+                    call_name, module_qn, local_var_types, class_qn
+                )
+
+            if not callee_info:
+                continue
+
+            callee_type, callee_qn = callee_info
+
+            logger.info(
+                f"  Creating class-level CALLS relationship: "
+                f"{class_type}({class_qn}) -> {callee_type}({callee_qn})"
+            )
+
+            self.ingestor.ensure_relationship_batch(
+                (class_type, "qualified_name", class_qn),
+                "CALLS",
+                (callee_type, "qualified_name", callee_qn),
+            )
+
+    def _get_class_type(self, class_node: Node) -> str:
+        """Determine the type of class node (Class, Interface, or Enum)."""
+        if class_node.type == "interface_declaration":
+            return "Interface"
+        elif class_node.type in ["enum_declaration", "enum_specifier"]:
+            return "Enum"
+        else:
+            return "Class"
+
     def _process_module_level_calls(
         self, root_node: Node, module_qn: str, language: str, queries: dict[str, Any]
     ) -> None:
         """Process top-level calls in the module (like IIFE calls)."""
-        # Print current Node information
-        node_info = f" (Node: {root_node.type}, start: {root_node.start_point}, end: {root_node.end_point})"
-
-        logger.debug(
-            f"🔍 Processing calls for module level: '{module_qn}' (language: {language}){node_info}"
-        )
-
-        # For Java, we need to exclude call nodes that are already inside methods/functions
-        # to avoid duplicate processing
+        # For Java, skip module-level call processing
+        # Java doesn't have true module-level code - all code must be inside classes/interfaces/enums
+        # Class-level calls (static blocks, instance initializers) are handled in _process_calls_in_classes
         if language == "java":
-            self._ingest_module_level_calls_excluding_methods(
-                root_node, module_qn, language, queries
-            )
-        else:
-            # Process calls that are directly at module level, not inside functions/classes
-            self._ingest_function_calls(
-                root_node, module_qn, "Module", module_qn, language, queries
-            )
+            return
+
+        # Process calls that are directly at module level, not inside functions/classes
+        self._ingest_function_calls(
+            root_node, module_qn, "Module", module_qn, language, queries
+        )
 
     def _ingest_module_level_calls_excluding_methods(
         self, root_node: Node, module_qn: str, language: str, queries: dict[str, Any]
     ) -> None:
         """Process module-level calls excluding those already inside methods/functions."""
-        # Print current Node information
-        node_info = f" (Node: {root_node.type}, start: {root_node.start_point}, end: {root_node.end_point})"
-
         calls_query = queries[language].get("calls")
         if not calls_query:
             return
@@ -441,24 +476,12 @@ class CallProcessor:
             if not self._is_call_inside_method_or_function(call_node, language):
                 module_level_call_nodes.append(call_node)
 
-        logger.debug(
-            f"Found {len(module_level_call_nodes)} module-level call nodes "
-            f"(filtered from {len(all_call_nodes)} total call nodes){node_info}"
-        )
-
         # Process the filtered call nodes
         local_var_types = self.type_inference.build_local_variable_type_map(
             root_node, module_qn, language
         )
 
         for i, call_node in enumerate(module_level_call_nodes, 1):
-            call_text = call_node.text.decode("utf8") if call_node.text else "unknown"
-            call_type = call_node.type
-
-            logger.debug(
-                f"📞 Processing module-level call node {i}/{len(module_level_call_nodes)}: '{call_text}' (type: {call_type}){node_info}"
-            )
-
             # Process nested calls first (inner to outer)
             self._process_nested_calls_in_node(
                 call_node,
@@ -467,16 +490,12 @@ class CallProcessor:
                 module_qn,
                 local_var_types,
                 None,  # No class context for module-level calls
+                language,
             )
 
             call_name = self._get_call_target_name(call_node)
             if not call_name:
-                logger.debug(
-                    f"❌ Could not extract call name from module-level call node {i}"
-                )
                 continue
-
-            logger.debug(f"📝 Extracted call name: '{call_name}'")
 
             # Use Java-specific resolution for Java method calls
             if language == "java" and call_node.type == "method_invocation":
@@ -504,10 +523,9 @@ class CallProcessor:
             else:
                 callee_type, callee_qn = callee_info
 
-            logger.debug(
-                f"      Found module-level call from {module_qn} to {call_name} "
-                f"(resolved as {callee_type}:{callee_qn})"
-            )
+            # Skip Function type relationships for Java (Java only has Method, not Function)
+            if language == "java" and callee_type == "Function":
+                continue
 
             self.ingestor.ensure_relationship_batch(
                 ("Module", "qualified_name", module_qn),
@@ -676,22 +694,9 @@ class CallProcessor:
         captures = cursor.captures(caller_node)
         call_nodes = captures.get("call", [])
 
-        logger.debug(
-            f"Found {len(call_nodes)} call nodes in {language} for {caller_qn}"
-        )
-
         for i, call_node in enumerate(call_nodes, 1):
             if not isinstance(call_node, Node):
-                logger.debug(f"⚠️ Call node {i} is not a valid Node instance")
                 continue
-
-            # Extract basic call node information for debugging
-            call_text = call_node.text.decode("utf8") if call_node.text else "unknown"
-            call_type = call_node.type
-
-            logger.debug(
-                f"📞 Processing call node {i}/{len(call_nodes)}: '{call_text}' (type: {call_type})"
-            )
 
             # Process nested calls first (inner to outer)
             self._process_nested_calls_in_node(
@@ -701,14 +706,12 @@ class CallProcessor:
                 module_qn,
                 local_var_types,
                 class_context,
+                language,
             )
 
             call_name = self._get_call_target_name(call_node)
             if not call_name:
-                logger.debug(f"❌ Could not extract call name from call node {i}")
                 continue
-
-            logger.debug(f"📝 Extracted call name: '{call_name}'")
 
             # Use Java-specific resolution for Java method calls
             if language == "java" and call_node.type == "method_invocation":
@@ -734,10 +737,12 @@ class CallProcessor:
                     callee_type, callee_qn = builtin_info
             else:
                 callee_type, callee_qn = callee_info
-            logger.debug(
-                f"      Found call from {caller_qn} to {call_name} "
-                f"(resolved as {callee_type}:{callee_qn})"
-            )
+
+            # Skip Function type relationships for Java (Java only has Method, not Function)
+            if language == "java" and (
+                caller_type == "Function" or callee_type == "Function"
+            ):
+                continue
 
             self.ingestor.ensure_relationship_batch(
                 (caller_type, "qualified_name", caller_qn),
@@ -753,6 +758,7 @@ class CallProcessor:
         module_qn: str,
         local_var_types: dict[str, str] | None,
         class_context: str | None,
+        language: str = "",
     ) -> None:
         """Process nested call expressions within a call node's function expression."""
         # Get the function expression of this call
@@ -770,6 +776,7 @@ class CallProcessor:
                 module_qn,
                 local_var_types,
                 class_context,
+                language,
             )
 
     def _find_and_process_nested_calls(
@@ -780,13 +787,20 @@ class CallProcessor:
         module_qn: str,
         local_var_types: dict[str, str] | None,
         class_context: str | None,
+        language: str = "",
     ) -> None:
         """Recursively find and process call expressions in a node tree."""
         # If this node is a call expression, process it
         if node.type == "call":
             # First process any nested calls within this call
             self._process_nested_calls_in_node(
-                node, caller_qn, caller_type, module_qn, local_var_types, class_context
+                node,
+                caller_qn,
+                caller_type,
+                module_qn,
+                local_var_types,
+                class_context,
+                language,
             )
 
             # Then process this call itself
@@ -797,20 +811,29 @@ class CallProcessor:
                 )
                 if callee_info:
                     callee_type, callee_qn = callee_info
-                    logger.debug(
-                        f"      Found nested call from {caller_qn} to {call_name} "
-                        f"(resolved as {callee_type}:{callee_qn})"
-                    )
-                    self.ingestor.ensure_relationship_batch(
-                        (caller_type, "qualified_name", caller_qn),
-                        "CALLS",
-                        (callee_type, "qualified_name", callee_qn),
-                    )
+
+                    # Skip Function type relationships for Java (Java only has Method, not Function)
+                    if language == "java" and (
+                        caller_type == "Function" or callee_type == "Function"
+                    ):
+                        pass  # Skip silently
+                    else:
+                        self.ingestor.ensure_relationship_batch(
+                            (caller_type, "qualified_name", caller_qn),
+                            "CALLS",
+                            (callee_type, "qualified_name", callee_qn),
+                        )
 
         # Recursively search in all child nodes
         for child in node.children:
             self._find_and_process_nested_calls(
-                child, caller_qn, caller_type, module_qn, local_var_types, class_context
+                child,
+                caller_qn,
+                caller_type,
+                module_qn,
+                local_var_types,
+                class_context,
+                language,
             )
 
     def _resolve_function_call(
@@ -850,9 +873,6 @@ class CallProcessor:
             if call_name in import_map:
                 imported_qn = import_map[call_name]
                 if imported_qn in self.function_registry:
-                    logger.debug(
-                        f"Direct import resolved: {call_name} -> {imported_qn}"
-                    )
                     return self.function_registry[imported_qn], imported_qn
 
             # 1a.2. Handle qualified calls like "Class.method" and "self.attr.method"
@@ -879,11 +899,6 @@ class CallProcessor:
                         if class_qn:
                             method_qn = f"{class_qn}.{method_name}"
                             if method_qn in self.function_registry:
-                                logger.debug(
-                                    f"Type-inferred object method resolved: "
-                                    f"{call_name} -> {method_qn} "
-                                    f"(via {object_name}:{var_type})"
-                                )
                                 return self.function_registry[method_qn], method_qn
 
                             # Check inheritance for this method
@@ -891,11 +906,6 @@ class CallProcessor:
                                 class_qn, method_name
                             )
                             if inherited_method:
-                                logger.debug(
-                                    f"Type-inferred inherited object method resolved: "
-                                    f"{call_name} -> {inherited_method[1]} "
-                                    f"(via {object_name}:{var_type})"
-                                )
                                 return inherited_method
 
                         # Check if this is a built-in JavaScript type
@@ -909,9 +919,6 @@ class CallProcessor:
                     # Fallback: Try to find the method in the same module
                     method_qn = f"{module_qn}.{method_name}"
                     if method_qn in self.function_registry:
-                        logger.debug(
-                            f"Object method resolved: {call_name} -> {method_qn}"
-                        )
                         return self.function_registry[method_qn], method_qn
 
                 # Special handling for self.attribute.method patterns
@@ -935,11 +942,6 @@ class CallProcessor:
                         if class_qn:
                             method_qn = f"{class_qn}.{method_name}"
                             if method_qn in self.function_registry:
-                                logger.debug(
-                                    f"Instance-resolved self-attribute call: "
-                                    f"{call_name} -> {method_qn} "
-                                    f"(via {attribute_ref}:{var_type})"
-                                )
                                 return self.function_registry[method_qn], method_qn
 
                             # Check inheritance for this method
@@ -947,11 +949,6 @@ class CallProcessor:
                                 class_qn, method_name
                             )
                             if inherited_method:
-                                logger.debug(
-                                    f"Instance-resolved inherited self-attribute call: "
-                                    f"{call_name} -> {inherited_method[1]} "
-                                    f"(via {attribute_ref}:{var_type})"
-                                )
                                 return inherited_method
                 else:
                     # Regular Class.method pattern
@@ -963,10 +960,6 @@ class CallProcessor:
                         class_qn = import_map[class_name]
                         method_qn = f"{class_qn}.{method_name}"
                         if method_qn in self.function_registry:
-                            logger.debug(
-                                f"Import-resolved qualified call: "
-                                f"{call_name} -> {method_qn}"
-                            )
                             return self.function_registry[method_qn], method_qn
 
                     # Then, check if the base is a local variable with known type
@@ -986,11 +979,6 @@ class CallProcessor:
                         if class_qn:
                             method_qn = f"{class_qn}.{method_name}"
                             if method_qn in self.function_registry:
-                                logger.debug(
-                                    f"Instance-resolved qualified call: "
-                                    f"{call_name} -> {method_qn} "
-                                    f"(via {class_name}:{var_type})"
-                                )
                                 return self.function_registry[method_qn], method_qn
 
                             # If method not found in the class, check inheritance chain
@@ -998,12 +986,6 @@ class CallProcessor:
                                 class_qn, method_name
                             )
                             if inherited_method:
-                                inherited_method_qn = inherited_method[1]
-                                logger.debug(
-                                    f"Instance-resolved inherited call: "
-                                    f"{call_name} -> {inherited_method_qn} "
-                                    f"(via {class_name}:{var_type})"
-                                )
                                 return inherited_method
 
             # 1b. Check wildcard imports
@@ -1023,18 +1005,12 @@ class CallProcessor:
 
                     for wildcard_qn in potential_qns:
                         if wildcard_qn in self.function_registry:
-                            logger.debug(
-                                f"Wildcard-resolved call: {call_name} -> {wildcard_qn}"
-                            )
                             return self.function_registry[wildcard_qn], wildcard_qn
 
         # Phase 2: Heuristic-based resolution (less accurate but often effective)
         # 2a. Check for a function in the same module
         same_module_func_qn = f"{module_qn}.{call_name}"
         if same_module_func_qn in self.function_registry:
-            logger.debug(
-                f"Same-module resolution: {call_name} -> {same_module_func_qn}"
-            )
             return (
                 self.function_registry[same_module_func_qn],
                 same_module_func_qn,
@@ -1050,15 +1026,11 @@ class CallProcessor:
             )
             # Take the most likely candidate.
             best_candidate_qn = possible_matches[0]
-            logger.debug(
-                f"Trie-based fallback resolution: {call_name} -> {best_candidate_qn}"
-            )
             return (
                 self.function_registry[best_candidate_qn],
                 best_candidate_qn,
             )
 
-        logger.debug(f"Could not resolve call: {call_name}")
         return None
 
     def _resolve_builtin_call(self, call_name: str) -> tuple[str, str] | None:
@@ -1217,10 +1189,6 @@ class CallProcessor:
             method_qn = f"{full_object_type}.{final_method}"
 
             if method_qn in self.function_registry:
-                logger.debug(
-                    f"Resolved chained call: {call_name} -> {method_qn} "
-                    f"(via {object_expr}:{object_type})"
-                )
                 return self.function_registry[method_qn], method_qn
 
             # Also check inheritance for the final method
@@ -1228,10 +1196,6 @@ class CallProcessor:
                 full_object_type, final_method
             )
             if inherited_method:
-                logger.debug(
-                    f"Resolved chained inherited call: {call_name} -> {inherited_method[1]} "
-                    f"(via {object_expr}:{object_type})"
-                )
                 return inherited_method
 
         return None
@@ -1262,29 +1226,22 @@ class CallProcessor:
         # Use the provided class context
         current_class_qn = class_context
         if not current_class_qn:
-            logger.debug(f"No class context provided for super() call: {call_name}")
             return None
 
         # Look up parent classes for the current class
         if current_class_qn not in self.class_inheritance:
-            logger.debug(f"No inheritance info for class {current_class_qn}")
             return None
 
         parent_classes = self.class_inheritance[current_class_qn]
         if not parent_classes:
-            logger.debug(f"No parent classes found for {current_class_qn}")
             return None
 
         # Use inheritance chain traversal to find the method
         result = self._resolve_inherited_method(current_class_qn, method_name)
         if result:
             callee_type, parent_method_qn = result
-            logger.debug(f"Resolved super() call: {call_name} -> {parent_method_qn}")
             return callee_type, parent_method_qn
 
-        logger.debug(
-            f"Could not resolve super() call: {call_name} in parents of {current_class_qn}"
-        )
         return None
 
     def _resolve_inherited_method(
@@ -1413,10 +1370,5 @@ class CallProcessor:
         result = java_engine.resolve_java_method_call(
             call_node, local_var_types, module_qn
         )
-
-        if result:
-            logger.debug(
-                f"Java method call resolved: {call_node.text.decode('utf8') if call_node.text else 'unknown'} -> {result[1]}"
-            )
 
         return result

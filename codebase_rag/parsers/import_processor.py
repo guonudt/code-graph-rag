@@ -152,6 +152,8 @@ class ImportProcessor:
         self.ingestor = ingestor
         self.function_registry = function_registry
         self.import_mapping: dict[str, dict[str, str]] = {}
+        # Store pending imports for delayed processing (after all classes are registered)
+        self.pending_imports: dict[str, dict[str, Any]] = {}
 
         # Load persistent cache on initialization
         _load_persistent_cache()
@@ -250,15 +252,38 @@ class ImportProcessor:
                 # Generic fallback for other languages
                 self._parse_generic_imports(captures, module_qn, lang_config)
 
-            logger.debug(
-                f"Parsed {len(self.import_mapping[module_qn])} imports in {module_qn}"
-            )
+            # Store imports for delayed processing (after all classes are registered)
+            # This ensures function_registry is fully populated before resolving module paths
+            if module_qn in self.import_mapping and self.import_mapping[module_qn]:
+                imports_copy: dict[str, str] = self.import_mapping[module_qn].copy()
+                self.pending_imports[module_qn] = {
+                    "imports": imports_copy,
+                    "language": language,
+                }
 
-            # Create IMPORTS relationships for each parsed import
-            if self.ingestor and module_qn in self.import_mapping:
-                for local_name, full_name in self.import_mapping[module_qn].items():
+        except Exception as e:
+            logger.warning(f"Failed to parse imports in {module_qn}: {e}")
+
+    def process_all_imports(self) -> None:
+        """Process IMPORTS relationships for all modules after all classes are registered.
+
+        This method is called after all files have been parsed and all classes are registered
+        in function_registry. This ensures that when resolving module paths from imports,
+        all classes are available for lookup.
+        """
+        logger.info("--- Pass 3.6: Processing Import Relationships ---")
+        logger.info(f"Processing imports for {len(self.pending_imports)} modules")
+
+        total_imports = 0
+        for module_qn, info in self.pending_imports.items():
+            imports_dict: dict[str, str] = info.get("imports", {})
+            language: str = info.get("language", "python")
+
+            if self.ingestor and isinstance(imports_dict, dict):
+                for local_name, full_name in imports_dict.items():
                     # Extract just the module path for the IMPORTS relationship
                     # This ensures Module -> Module relationships, not Module -> Class/Function
+                    # Now function_registry is fully populated, so resolution will be more accurate
                     module_path = self._extract_module_path(full_name, language)
 
                     self.ingestor.ensure_relationship_batch(
@@ -266,12 +291,12 @@ class ImportProcessor:
                         "IMPORTS",
                         ("Module", "qualified_name", module_path),
                     )
-                    logger.debug(
+                    logger.info(
                         f"  Created IMPORTS relationship: {module_qn} -> {module_path} (from {full_name})"
                     )
+                    total_imports += 1
 
-        except Exception as e:
-            logger.warning(f"Failed to parse imports in {module_qn}: {e}")
+        logger.info(f"Completed processing {total_imports} import relationships")
 
     def _parse_python_imports(self, captures: dict, module_qn: str) -> None:
         """Parse Python import statements with full support for all import types."""
@@ -300,7 +325,6 @@ class ImportProcessor:
                     full_name = module_name  # For stdlib or third-party
 
                 self.import_mapping[module_qn][local_name] = full_name
-                logger.debug(f"  Import: {local_name} -> {full_name}")
             elif child.type == "aliased_import":
                 # Handle 'import module as alias'
                 module_name_node = child.child_by_field_name("name")
@@ -324,7 +348,6 @@ class ImportProcessor:
                         full_name = module_name
 
                     self.import_mapping[module_qn][alias] = full_name
-                    logger.debug(f"  Aliased import: {alias} -> {full_name}")
 
     def _handle_python_import_from_statement(
         self, import_node: Node, module_qn: str
@@ -393,13 +416,11 @@ class ImportProcessor:
                 # Handle wildcard import: from module import *
                 wildcard_key = f"*{base_module}"
                 self.import_mapping[module_qn][wildcard_key] = base_module
-                logger.debug(f"  Wildcard import: * -> {base_module}")
             else:
                 # Handle regular imports
                 for local_name, original_name in imported_items:
                     full_name = f"{base_module}.{original_name}"
                     self.import_mapping[module_qn][local_name] = full_name
-                    logger.debug(f"  From import: {local_name} -> {full_name}")
 
     def _resolve_relative_import(self, relative_node: Node, module_qn: str) -> str:
         """Resolve relative imports like '.module' or '..parent.module'."""
@@ -495,9 +516,6 @@ class ImportProcessor:
                 self.import_mapping[current_module][imported_name] = (
                     f"{source_module}.default"
                 )
-                logger.debug(
-                    f"JS default import: {imported_name} -> {source_module}.default"
-                )
 
             elif child.type == "named_imports":
                 # Named imports: import { func1, func2 } from './module'
@@ -519,10 +537,6 @@ class ImportProcessor:
                             self.import_mapping[current_module][local_name] = (
                                 f"{source_module}.{imported_name}"
                             )
-                            logger.debug(
-                                f"JS named import: {local_name} -> "
-                                f"{source_module}.{imported_name}"
-                            )
 
             elif child.type == "namespace_import":
                 # Namespace import: import * as utils from './utils'
@@ -531,9 +545,6 @@ class ImportProcessor:
                         namespace_name = safe_decode_with_fallback(grandchild)
                         self.import_mapping[current_module][namespace_name] = (
                             source_module
-                        )
-                        logger.debug(
-                            f"JS namespace import: {namespace_name} -> {source_module}"
                         )
                         break
 
@@ -576,9 +587,6 @@ class ImportProcessor:
                                 self.import_mapping[current_module][var_name] = (
                                     resolved_module
                                 )
-                                logger.debug(
-                                    f"JS require: {var_name} -> {resolved_module}"
-                                )
                                 break
 
     def _parse_js_reexport(self, export_node: Node, current_module: str) -> None:
@@ -614,15 +622,10 @@ class ImportProcessor:
                             self.import_mapping[current_module][exported_name] = (
                                 f"{source_module}.{original_name}"
                             )
-                            logger.debug(
-                                f"JS re-export: {exported_name} -> "
-                                f"{source_module}.{original_name}"
-                            )
             elif child.type == "*":
                 # Handle namespace re-exports: export * from './module'
                 wildcard_key = f"*{source_module}"
                 self.import_mapping[current_module][wildcard_key] = source_module
-                logger.debug(f"JS namespace re-export: * -> {source_module}")
 
     def _parse_java_imports(self, captures: dict, module_qn: str) -> None:
         """Parse Java import statements."""
@@ -647,7 +650,6 @@ class ImportProcessor:
 
                 if is_wildcard:
                     # import java.util.*; - wildcard import
-                    logger.debug(f"Java wildcard import: {imported_path}.*")
                     # Store wildcard import for potential future use
                     self.import_mapping[module_qn][f"*{imported_path}"] = imported_path
                 else:
@@ -660,17 +662,10 @@ class ImportProcessor:
                             self.import_mapping[module_qn][imported_name] = (
                                 imported_path
                             )
-                            logger.debug(
-                                f"Java static import: {imported_name} -> "
-                                f"{imported_path}"
-                            )
                         else:
                             # Regular class import
                             self.import_mapping[module_qn][imported_name] = (
                                 imported_path
-                            )
-                            logger.debug(
-                                f"Java import: {imported_name} -> {imported_path}"
                             )
 
     def _parse_rust_imports(self, captures: dict, module_qn: str) -> None:
@@ -688,7 +683,6 @@ class ImportProcessor:
         # Add all extracted imports to the import mapping
         for imported_name, full_path in imports.items():
             self.import_mapping[module_qn][imported_name] = full_path
-            logger.debug(f"Rust import: {imported_name} -> {full_path}")
 
     def _parse_go_imports(self, captures: dict, module_qn: str) -> None:
         """Parse Go import declarations."""
@@ -735,7 +729,6 @@ class ImportProcessor:
 
             # Map package name to full import path
             self.import_mapping[module_qn][package_name] = import_path
-            logger.debug(f"Go import: {package_name} -> {import_path}")
 
     def _parse_cpp_imports(self, captures: dict, module_qn: str) -> None:
         """Parse C++ #include statements and C++20 module imports."""
@@ -790,9 +783,6 @@ class ImportProcessor:
                 full_name = f"{self.project_name}.{path_parts}"
 
             self.import_mapping[module_qn][local_name] = full_name
-            logger.debug(
-                f"C++ include: {local_name} -> {full_name} (system: {is_system_include})"
-            )
 
     def _parse_cpp_module_import(self, import_node: Node, module_qn: str) -> None:
         """Parse C++20 module import statements like 'import <iostream>;'."""
@@ -826,7 +816,6 @@ class ImportProcessor:
                     full_name = f"std.{module_name}"
 
                     self.import_mapping[module_qn][local_name] = full_name
-                    logger.debug(f"C++20 module import: {local_name} -> {full_name}")
 
     def _parse_cpp_module_declaration(self, decl_node: Node, module_qn: str) -> None:
         """Parse C++20 module declarations and partition imports."""
@@ -845,7 +834,6 @@ class ImportProcessor:
                 self.import_mapping[module_qn][module_name] = (
                     f"{self.project_name}.{module_name}"
                 )
-                logger.debug(f"C++20 module implementation: {module_name}")
 
         elif decl_text.startswith("export module "):
             # Parse "export module math_operations;" - this is a module interface
@@ -856,7 +844,6 @@ class ImportProcessor:
                 self.import_mapping[module_qn][module_name] = (
                     f"{self.project_name}.{module_name}"
                 )
-                logger.debug(f"C++20 module interface: {module_name}")
 
         elif "import :" in decl_text:
             # Parse "export import :partition_name;" - this is a partition import
@@ -869,9 +856,6 @@ class ImportProcessor:
                     partition_name = f"partition_{partition_part}"
                     full_name = f"{self.project_name}.{partition_part}"
                     self.import_mapping[module_qn][partition_name] = full_name
-                    logger.debug(
-                        f"C++20 module partition import: {partition_name} -> {full_name}"
-                    )
 
     def _parse_generic_imports(
         self, captures: dict, module_qn: str, lang_config: LanguageConfig
@@ -1517,7 +1501,33 @@ int main() {{
         return full_qualified_name
 
     def _extract_java_stdlib_path(self, full_qualified_name: str) -> str:
-        """Extract Java stdlib module path using reflection."""
+        """Extract Java stdlib module path using reflection.
+
+        For Java, this should return the full qualified class name in project format.
+        E.g., com.alibaba.havana.demo.tddl.TddlController should be converted to
+        hellodemo.hellodemo-start.src.main.java.com.alibaba.havana.demo.tddl.TddlController
+        """
+        # First, try to find the class in function_registry by matching the end of qualified names
+        # The function_registry contains entries like:
+        # "hellodemo.hellodemo-start.src.main.java.com.alibaba.havana.demo.tddl.TddlController"
+        # We need to find entries that end with the import path
+        if self.function_registry:
+            for registered_qn in self.function_registry.keys():
+                # Check if the registered qualified name ends with the import path
+                # For Java, the file path includes the package structure
+                # e.g., registered_qn might be "project.module.src.main.java.com.example.MyClass"
+                # and full_qualified_name is "com.example.MyClass"
+                if registered_qn.endswith(
+                    "." + full_qualified_name
+                ) or registered_qn.endswith(full_qualified_name):
+                    # Verify it's actually a Class or Interface
+                    entity_type = self.function_registry[registered_qn]
+                    if entity_type in ("Class", "Interface", "Enum"):
+                        logger.debug(
+                            f"Found Java class in registry: {full_qualified_name} -> {registered_qn}"
+                        )
+                        return str(registered_qn)
+
         parts = full_qualified_name.split(".")
         if len(parts) >= 2:
             # Use Java reflection via subprocess to avoid direct Java dependency
@@ -1619,7 +1629,9 @@ public class StdlibCheck {
                         if run_result.returncode == 0:
                             data = json.loads(run_result.stdout.strip())
                             if data.get("hasEntity"):
-                                return ".".join(parts[:-1])
+                                # For Java, return the full qualified class name
+                                # Java imports refer to classes, not packages
+                                return full_qualified_name
 
                 finally:
                     # Clean up temporary files
@@ -1640,32 +1652,15 @@ public class StdlibCheck {
                 pass
 
             # Fallback using Java naming conventions
-            entity_name = parts[-1]
-            if (
-                entity_name[0].isupper()  # Classes start with uppercase
-                or entity_name.endswith("Exception")
-                or entity_name.endswith("Error")
-                or entity_name.endswith("Interface")
-                or entity_name.endswith("Builder")
-                or entity_name
-                in {  # Common Java stdlib classes
-                    "String",
-                    "Object",
-                    "Integer",
-                    "Double",
-                    "Boolean",
-                    "ArrayList",
-                    "HashMap",
-                    "HashSet",
-                    "LinkedList",
-                    "File",
-                    "URL",
-                    "Pattern",
-                    "LocalDateTime",
-                    "BigDecimal",
-                }
-            ):
-                return ".".join(parts[:-1])
+            # For Java imports, the qualified name typically refers to a class
+            # e.g., "import com.example.MyClass" imports the class MyClass
+            # So we should return the full qualified name as-is for Java
+            # The class name itself is the "module" being imported
+
+            # Java uses qualified class names in imports, not package names
+            # So "com.example.MyClass" should return "com.example.MyClass"
+            # This is different from Python where we might want the module path
+            pass
 
         return full_qualified_name
 

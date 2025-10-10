@@ -19,12 +19,21 @@ class MemgraphIngestor:
         self.relationship_counters: dict[str, int] = defaultdict(
             int
         )  # Track relationship types
+        self.node_counters: dict[str, int] = defaultdict(int)  # Track node types
+        self._flushed = False  # Track if flush_all has been called
+        # Track unique nodes and relationships to prevent duplicates in buffer
+        self.seen_nodes: set[str] = set()
+        self.seen_relationships: set[str] = set()
+        self.skipped_duplicate_nodes: int = 0
+        self.skipped_duplicate_relationships: int = 0
         self.unique_constraints = {
             "Project": "name",
             "Package": "qualified_name",
             "Folder": "path",
             "Module": "qualified_name",
+            "Interface": "qualified_name",
             "Class": "qualified_name",
+            "Enum": "qualified_name",
             "Function": "qualified_name",
             "Method": "qualified_name",
             "File": "path",
@@ -84,20 +93,38 @@ class MemgraphIngestor:
             cursor = self.conn.cursor()
             batch_query = f"UNWIND $batch AS row\n{query}"
 
-            # Log batch execution details
-            logger.debug(f"🔄 Executing batch query with {len(params_list)} items")
-            logger.debug(f"   Query: {query}")
-
             cursor.execute(batch_query, {"batch": params_list})
-            logger.debug("✅ Batch query executed successfully")
         except Exception as e:
-            if "already exists" not in str(e).lower():
-                logger.error(f"!!! Batch Cypher Error: {e}")
-                logger.error(f"   Batch size: {len(params_list)}")
-                logger.error(f"   Query: {query}")
-                # Log sample of problematic parameters
-                if params_list:
-                    logger.error(f"   Sample parameters: {params_list[:2]}")
+            logger.error(f"!!! Batch Cypher Error: {e}")
+            logger.error(f"   Batch size: {len(params_list)}")
+            logger.error(f"   Query: {query}")
+            # Log sample of problematic parameters
+            if params_list:
+                logger.error(f"   Sample parameters: {params_list[:2]}")
+            raise
+        finally:
+            if cursor:
+                cursor.close()
+
+    def _execute_batch_query(
+        self, query: str, params_list: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Execute a batch query that returns results (unlike _execute_batch which is for writes)."""
+        if not self.conn or not params_list:
+            return []
+        cursor = None
+        try:
+            cursor = self.conn.cursor()
+            batch_query = f"UNWIND $batch AS row\n{query}"
+            cursor.execute(batch_query, {"batch": params_list})
+
+            if not cursor.description:
+                return []
+            column_names = [desc.name for desc in cursor.description]
+            return [dict(zip(column_names, row)) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.debug(f"Batch query error: {e}")
+            return []
         finally:
             if cursor:
                 cursor.close()
@@ -110,7 +137,13 @@ class MemgraphIngestor:
     def reset_counters(self) -> None:
         """Reset relationship counters for a new processing session."""
         self.relationship_counters.clear()
-        logger.debug("🔄 Reset relationship counters for new session")
+        self.node_counters.clear()
+        self.seen_nodes.clear()
+        self.seen_relationships.clear()
+        self.skipped_duplicate_nodes = 0
+        self.skipped_duplicate_relationships = 0
+        self._flushed = False
+        logger.debug("🔄 Reset counters and deduplication sets for new session")
 
     def ensure_constraints(self) -> None:
         logger.info("Ensuring constraints...")
@@ -124,8 +157,28 @@ class MemgraphIngestor:
         logger.info("Constraints checked/created.")
 
     def ensure_node_batch(self, label: str, properties: dict[str, Any]) -> None:
-        """Adds a node to the buffer."""
+        """Adds a node to the buffer if it's not already present."""
+        # Check for duplicates using unique constraint
+        unique_key = self.unique_constraints.get(label)
+        if unique_key and unique_key in properties:
+            key_value = properties[unique_key]
+            node_key = f"{label}:{key_value}"
+
+            # Skip if node already in buffer
+            if node_key in self.seen_nodes:
+                self.skipped_duplicate_nodes += 1
+                logger.debug(
+                    f"⏭️ Skipping duplicate node: {label}({unique_key}={key_value})"
+                )
+                return
+
+            # Mark as seen
+            self.seen_nodes.add(node_key)
+
+        # Add node to buffer
         self.node_buffer.append((label, properties))
+        # Track node type count
+        self.node_counters[label] += 1
 
     def ensure_relationship_batch(
         self,
@@ -134,9 +187,21 @@ class MemgraphIngestor:
         to_spec: tuple[str, str, Any],
         properties: dict[str, Any] | None = None,
     ) -> None:
-        """Adds a relationship to the buffer."""
+        """Adds a relationship to the buffer if it's not already present."""
         from_label, from_key, from_val = from_spec
         to_label, to_key, to_val = to_spec
+
+        # Check for duplicates
+        rel_key = f"{from_label}:{from_val}--[{rel_type}]-->{to_label}:{to_val}"
+
+        # Skip if relationship already in buffer
+        if rel_key in self.seen_relationships:
+            self.skipped_duplicate_relationships += 1
+            logger.debug(f"⏭️ Skipping duplicate relationship: {rel_key}")
+            return
+
+        # Mark as seen
+        self.seen_relationships.add(rel_key)
 
         relationship_entry = (
             (from_label, from_key, from_val),
@@ -149,27 +214,16 @@ class MemgraphIngestor:
         # Track relationship type count
         self.relationship_counters[rel_type] += 1
 
-        # Log relationship creation for debugging
-        logger.debug(
-            f"🔗 Added relationship: {from_label}({from_key}={from_val})--[{rel_type}]-->{to_label}({to_key}={to_val})"
-        )
-
     def flush_nodes(self) -> None:
         """Flushes the buffered nodes to the database."""
         if not self.node_buffer:
-            logger.debug("📝 No nodes to flush - buffer is empty")
             return
 
-        logger.info(f"📝 Starting to flush {len(self.node_buffer)} nodes...")
+        logger.info(f"Flushing {len(self.node_buffer)} nodes...")
 
         nodes_by_label = defaultdict(list)
         for label, props in self.node_buffer:
             nodes_by_label[label].append(props)
-
-        # Log node counts by label
-        logger.info("📊 Node counts by label:")
-        for label, props_list in nodes_by_label.items():
-            logger.info(f"  - {label}: {len(props_list)} nodes")
 
         total_flushed = 0
         for label, props_list in nodes_by_label.items():
@@ -178,11 +232,9 @@ class MemgraphIngestor:
             id_key = self.unique_constraints.get(label)
             if not id_key:
                 logger.warning(
-                    f"⚠️ No unique constraint defined for label '{label}'. Skipping {len(props_list)} nodes."
+                    f"No unique constraint defined for label '{label}'. Skipping {len(props_list)} nodes."
                 )
                 continue
-
-            logger.debug(f"🔄 Flushing {len(props_list)} {label} nodes...")
             prop_keys = list(props_list[0].keys())
             set_clause = ", ".join([f"n.{key} = row.{key}" for key in prop_keys])
             query = (
@@ -193,36 +245,25 @@ class MemgraphIngestor:
             try:
                 self._execute_batch(query, props_list)
                 total_flushed += len(props_list)
-                logger.debug(f"✅ Successfully flushed {len(props_list)} {label} nodes")
             except Exception as e:
-                logger.error(f"❌ Failed to flush {len(props_list)} {label} nodes: {e}")
+                logger.error(f"Failed to flush {len(props_list)} {label} nodes: {e}")
                 raise
 
-        logger.info(f"✅ Successfully flushed {total_flushed} nodes total")
+        logger.info(f"Successfully flushed {total_flushed} nodes total")
+
         self.node_buffer.clear()
 
     def flush_relationships(self) -> None:
         if not self.relationship_buffer:
-            logger.debug("🔗 No relationships to flush - buffer is empty")
             return
 
-        logger.info(
-            f"🔗 Starting to flush {len(self.relationship_buffer)} relationships..."
-        )
+        logger.info(f"Flushing {len(self.relationship_buffer)} relationships...")
 
         rels_by_pattern = defaultdict(list)
         for from_node, rel_type, to_node, props in self.relationship_buffer:
             pattern = (from_node[0], from_node[1], rel_type, to_node[0], to_node[1])
             rels_by_pattern[pattern].append(
                 {"from_val": from_node[2], "to_val": to_node[2], "props": props or {}}
-            )
-
-        # Log relationship counts by pattern
-        logger.info("📊 Relationship counts by pattern:")
-        for pattern, params_list in rels_by_pattern.items():
-            from_label, from_key, rel_type, to_label, to_key = pattern
-            logger.info(
-                f"  - {from_label}--[{rel_type}]-->{to_label}: {len(params_list)} relationships"
             )
 
         total_flushed = 0
@@ -236,37 +277,86 @@ class MemgraphIngestor:
             if any(p["props"] for p in params_list):
                 query += "\nSET r += row.props"
 
-            logger.debug(
-                f"🔄 Flushing {len(params_list)} {rel_type} relationships ({from_label} -> {to_label})..."
-            )
-
             try:
+                # Check if both nodes exist before creating relationships
+                node_check_query = (
+                    f"OPTIONAL MATCH (a:{from_label} {{{from_key}: row.from_val}})\n"
+                    f"OPTIONAL MATCH (b:{to_label} {{{to_key}: row.to_val}})\n"
+                    f"RETURN row.from_val as from_val, row.to_val as to_val, "
+                    f"a IS NOT NULL as from_exists, b IS NOT NULL as to_exists"
+                )
+
+                try:
+                    node_check_result = self._execute_batch_query(
+                        node_check_query, params_list
+                    )
+
+                    if node_check_result:
+                        missing_from = sum(
+                            1
+                            for row in node_check_result
+                            if not row.get("from_exists", False)
+                        )
+                        missing_to = sum(
+                            1
+                            for row in node_check_result
+                            if not row.get("to_exists", False)
+                        )
+
+                        if missing_from > 0 or missing_to > 0:
+                            logger.warning(
+                                f"⚠️ Missing nodes for {rel_type} relationships:"
+                            )
+                            if missing_from > 0:
+                                logger.warning(
+                                    f"   - {missing_from} missing {from_label} nodes (from)"
+                                )
+                            if missing_to > 0:
+                                logger.warning(
+                                    f"   - {missing_to} missing {to_label} nodes (to)"
+                                )
+
+                            # Show a few examples of missing nodes (limit to 5)
+                            missing_examples = [
+                                row
+                                for row in node_check_result
+                                if not row.get("from_exists", False)
+                                or not row.get("to_exists", False)
+                            ][:5]
+
+                            if missing_examples:
+                                logger.warning(
+                                    "   Examples of missing nodes (showing up to 5):"
+                                )
+                                for ex in missing_examples:
+                                    from_status = "✓" if ex.get("from_exists") else "✗"
+                                    to_status = "✓" if ex.get("to_exists") else "✗"
+                                    logger.warning(
+                                        f"      {from_status} {from_label}({from_key}={ex['from_val']}) -> "
+                                        f"{to_status} {to_label}({to_key}={ex['to_val']})"
+                                    )
+                except Exception as e:
+                    logger.debug(
+                        f"Could not check node existence for {rel_type} relationships: {e}"
+                    )
+
                 self._execute_batch(query, params_list)
                 total_flushed += len(params_list)
-                logger.debug(
-                    f"✅ Successfully flushed {len(params_list)} {rel_type} relationships"
-                )
             except Exception as e:
                 logger.error(
-                    f"❌ Failed to write {len(params_list)} relationships of type {rel_type}: {e}"
+                    f"Failed to write {len(params_list)} relationships of type {rel_type}: {e}"
                 )
-                logger.error(f"   Query: {query}")
-                logger.error(f"   Parameters count: {len(params_list)}")
-                # Log first few parameters for debugging
-                if params_list:
-                    logger.error(f"   First few parameters: {params_list[:3]}")
                 raise
 
-        logger.info(f"✅ Successfully flushed {total_flushed} relationships total")
+        logger.info(f"Successfully flushed {total_flushed} relationships total")
         self.relationship_buffer.clear()
 
     def flush_all(self) -> None:
-        logger.info("--- Flushing all pending writes to database... ---")
+        if self._flushed:
+            logger.info("Flush already completed, skipping duplicate flush")
+            return
 
-        # Log buffer sizes before flushing
-        logger.info("📊 Buffer status before flush:")
-        logger.info(f"  - Nodes in buffer: {len(self.node_buffer)}")
-        logger.info(f"  - Relationships in buffer: {len(self.relationship_buffer)}")
+        logger.info("Flushing all pending writes to database...")
 
         # Track timing
         import time
@@ -277,180 +367,42 @@ class MemgraphIngestor:
         self.flush_relationships()
 
         flush_time = time.time() - start_time
-        logger.info(f"--- Flushing complete in {flush_time:.3f}s ---")
+        logger.info(f"Flushing complete in {flush_time:.3f}s")
 
         # Log relationship statistics
         self._log_relationship_statistics()
 
-        # Perform data integrity checks
-        self._perform_data_integrity_checks()
-
         # Verify data was written correctly
         self._verify_data_written()
+
+        # Mark as flushed to prevent duplicate calls
+        self._flushed = True
 
     def _log_relationship_statistics(self) -> None:
         """Log statistics about relationship types processed."""
         if not self.relationship_counters:
-            logger.info("📊 No relationships were processed in this session")
             return
 
-        logger.info("📊 Relationship statistics:")
+        logger.info("Relationship statistics:")
         total_relationships = sum(self.relationship_counters.values())
-        logger.info(f"  Total relationships processed: {total_relationships}")
+        logger.info(f"  Total relationships: {total_relationships}")
 
         # Sort by count (descending) for better readability
         sorted_rels = sorted(
             self.relationship_counters.items(), key=lambda x: x[1], reverse=True
         )
-        for rel_type, count in sorted_rels:
-            percentage = (
-                (count / total_relationships) * 100 if total_relationships > 0 else 0
-            )
-            logger.info(f"  - {rel_type}: {count} ({percentage:.1f}%)")
-
-    def _perform_data_integrity_checks(self) -> None:
-        """Perform basic data integrity checks after flushing."""
-        try:
-            logger.info("🔍 Performing data integrity checks...")
-
-            # Check for orphaned relationships (relationships pointing to non-existent nodes)
-            orphan_check_query = """
-            MATCH (a)-[r]->(b)
-            WHERE NOT EXISTS((a)-[:DEFINES|:IMPORTS|:CALLS|:INHERITS|:EXPORTS]->())
-            AND NOT EXISTS((b)-[:DEFINES|:IMPORTS|:CALLS|:INHERITS|:EXPORTS]->())
-            RETURN count(r) as orphaned_count
-            """
-
-            orphan_result = self._execute_query(orphan_check_query)
-            orphaned_count = orphan_result[0]["orphaned_count"] if orphan_result else 0
-
-            if orphaned_count > 0:
-                logger.warning(
-                    f"⚠️ Found {orphaned_count} potentially orphaned relationships"
-                )
-
-                # Print examples of orphaned CALLS relationships only
-                example_query = """
-                MATCH (a)-[r:CALLS]->(b)
-                WHERE NOT EXISTS((a)-[:DEFINES|:IMPORTS|:CALLS|:INHERITS|:EXPORTS]->())
-                AND NOT EXISTS((b)-[:DEFINES|:IMPORTS|:CALLS|:INHERITS|:EXPORTS]->())
-                RETURN labels(a) as from_labels, properties(a) as from_props,
-                       type(r) as rel_type,
-                       labels(b) as to_labels, properties(b) as to_props
-                LIMIT 20
-                """
-
-                try:
-                    examples = self._execute_query(example_query)
-                    logger.warning("📋 Examples of orphaned CALLS relationships:")
-                    for i, example in enumerate(examples, 1):
-                        from_labels = example.get("from_labels", [])
-                        from_props = example.get("from_props", {})
-                        rel_type = example.get("rel_type", "UNKNOWN")
-                        to_labels = example.get("to_labels", [])
-                        to_props = example.get("to_props", {})
-
-                        # Extract key identifiers for better readability
-                        from_id = (
-                            from_props.get("qualified_name")
-                            or from_props.get("name")
-                            or from_props.get("path")
-                            or "unknown"
-                        )
-                        to_id = (
-                            to_props.get("qualified_name")
-                            or to_props.get("name")
-                            or to_props.get("path")
-                            or "unknown"
-                        )
-
-                        logger.warning(
-                            f"  {i}. {from_labels[0] if from_labels else 'Unknown'}({from_id})--[{rel_type}]-->{to_labels[0] if to_labels else 'Unknown'}({to_id})"
-                        )
-
-                except Exception as e:
-                    logger.error(f"Failed to get orphaned relationship examples: {e}")
-            else:
-                logger.info("✅ No orphaned relationships detected")
-
-            # Check for nodes without any relationships
-            isolated_nodes_query = """
-            MATCH (n)
-            OPTIONAL MATCH (n)-[r]-()
-            WITH n, count(r) as rel_count
-            WHERE rel_count = 0
-            RETURN count(n) as isolated_count
-            """
-
-            isolated_result = self._execute_query(isolated_nodes_query)
-            isolated_count = (
-                isolated_result[0]["isolated_count"] if isolated_result else 0
-            )
-
-            if isolated_count > 0:
-                logger.warning(
-                    f"⚠️ Found {isolated_count} isolated nodes (nodes without relationships)"
-                )
-
-                # Print examples of isolated nodes
-                isolated_example_query = """
-                MATCH (n)
-                OPTIONAL MATCH (n)-[r]-()
-                WITH n, count(r) as rel_count
-                WHERE rel_count = 0
-                RETURN labels(n) as node_labels, properties(n) as node_props
-                LIMIT 5
-                """
-
-                try:
-                    examples = self._execute_query(isolated_example_query)
-                    logger.warning("📋 Examples of isolated nodes:")
-                    for i, example in enumerate(examples, 1):
-                        node_labels = example.get("node_labels", [])
-                        node_props = example.get("node_props", {})
-
-                        # Extract key identifiers for better readability
-                        node_id = (
-                            node_props.get("qualified_name")
-                            or node_props.get("name")
-                            or node_props.get("path")
-                            or "unknown"
-                        )
-
-                        logger.warning(
-                            f"  {i}. {node_labels[0] if node_labels else 'Unknown'}({node_id})"
-                        )
-
-                except Exception as e:
-                    logger.error(f"Failed to get isolated node examples: {e}")
-            else:
-                logger.info("✅ No isolated nodes detected")
-
-            # Check for duplicate relationships
-            duplicate_check_query = """
-            MATCH (a)-[r]->(b)
-            WITH a, b, type(r) as rel_type, count(r) as rel_count
-            WHERE rel_count > 1
-            RETURN sum(rel_count) as duplicate_count
-            """
-
-            duplicate_result = self._execute_query(duplicate_check_query)
-            duplicate_count = (
-                duplicate_result[0]["duplicate_count"] if duplicate_result else 0
-            )
-
-            if duplicate_count > 0:
-                logger.warning(f"⚠️ Found {duplicate_count} duplicate relationships")
-            else:
-                logger.info("✅ No duplicate relationships detected")
-
-        except Exception as e:
-            logger.error(f"❌ Data integrity check failed: {e}")
+        for rel_type, count in sorted_rels[:5]:  # Only show top 5
+            logger.info(f"  - {rel_type}: {count}")
 
     def _verify_data_written(self) -> None:
         """Verify that data was written correctly to the database."""
         try:
-            logger.info("🔍 Verifying data was written correctly...")
+            # Log what we expected to write from buffer
+            expected_relationships = sum(self.relationship_counters.values())
+            expected_nodes = sum(self.node_counters.values())
+            logger.info(
+                f"Expected from buffer - Nodes: {expected_nodes}, Relationships: {expected_relationships}"
+            )
 
             # Get current database statistics
             node_count_query = "MATCH (n) RETURN count(n) as node_count"
@@ -462,67 +414,126 @@ class MemgraphIngestor:
             current_nodes = node_result[0]["node_count"] if node_result else 0
             current_relationships = rel_result[0]["rel_count"] if rel_result else 0
 
-            logger.info("📊 Current database state:")
-            logger.info(f"  - Total nodes: {current_nodes}")
-            logger.info(f"  - Total relationships: {current_relationships}")
+            logger.info(
+                f"Actual in database - Nodes: {current_nodes}, Relationships: {current_relationships}"
+            )
 
-            # Check if we have expected minimum counts
-            if current_nodes == 0:
-                logger.warning(
-                    "⚠️ No nodes found in database - this might indicate a problem"
-                )
-            elif current_nodes < 10:  # Arbitrary threshold
-                logger.warning(
-                    f"⚠️ Very few nodes ({current_nodes}) in database - check if parsing worked correctly"
-                )
-            else:
-                logger.info(f"✅ Database contains {current_nodes} nodes")
+            # Compare expected vs actual
+            if expected_relationships > 0:
+                relationship_diff = expected_relationships - current_relationships
+                if relationship_diff > 0:
+                    logger.warning(
+                        f"⚠️ Database has {relationship_diff} fewer relationships than expected from buffer"
+                    )
+                elif relationship_diff < 0:
+                    logger.info(
+                        f"Database has {abs(relationship_diff)} more relationships than expected (possibly from previous runs)"
+                    )
 
-            if current_relationships == 0:
-                logger.warning(
-                    "⚠️ No relationships found in database - this might indicate a problem"
-                )
-            elif current_relationships < 5:  # Arbitrary threshold
-                logger.warning(
-                    f"⚠️ Very few relationships ({current_relationships}) in database - check if relationship processing worked correctly"
-                )
-            else:
-                logger.info(
-                    f"✅ Database contains {current_relationships} relationships"
-                )
-
-            # Check for specific relationship types
-            rel_type_query = """
-            MATCH ()-[r]->()
-            WITH type(r) as rel_type, count(r) as count
-            RETURN rel_type, count
-            ORDER BY count DESC
-            """
-
-            rel_type_result = self._execute_query(rel_type_query)
-            if rel_type_result:
-                logger.info("📊 Relationship types in database:")
-                for row in rel_type_result:
-                    logger.info(f"  - {row['rel_type']}: {row['count']}")
-
-            # Check for specific node types
-            node_type_query = """
-            MATCH (n)
-            WITH labels(n) as node_labels, count(n) as count
-            UNWIND node_labels as label
-            WITH label, count
-            RETURN label, count
-            ORDER BY count DESC
-            """
-
-            node_type_result = self._execute_query(node_type_query)
-            if node_type_result:
-                logger.info("📊 Node types in database:")
-                for row in node_type_result:
-                    logger.info(f"  - {row['label']}: {row['count']}")
+            if expected_nodes > 0:
+                node_diff = expected_nodes - current_nodes
+                if node_diff > 0:
+                    logger.warning(
+                        f"⚠️ Database has {node_diff} fewer nodes than expected from buffer"
+                    )
+                elif node_diff < 0:
+                    logger.info(
+                        f"Database has {abs(node_diff)} more nodes than expected (possibly from previous runs)"
+                    )
 
         except Exception as e:
-            logger.error(f"❌ Data verification failed: {e}")
+            logger.error(f"Data verification failed: {e}")
+
+    def _print_all_database_contents(self, limit: int = 100) -> None:
+        """Print all nodes and relationships currently in the database."""
+        try:
+            logger.info("📋 Printing all database contents...")
+
+            # Print all nodes - using properties() to get accurate data
+            logger.info("🏷️ All nodes in database:")
+            nodes_query = f"""
+            MATCH (n)
+            RETURN labels(n)[0] as label, properties(n) as props
+            ORDER BY label
+            LIMIT {limit}
+            """
+            nodes_result = self._execute_query(nodes_query)
+
+            if nodes_result:
+                current_label = None
+                node_count = 0
+                for row in nodes_result:
+                    label = row["label"]
+                    props = row["props"]
+
+                    # Group by label for better readability
+                    if current_label != label:
+                        current_label = label
+                        logger.info(f"  📂 {label} nodes:")
+
+                    # Get the unique identifier for this node type
+                    unique_key = self.unique_constraints.get(label, "name")
+                    unique_value = props.get(unique_key, "N/A")
+
+                    # Show all important properties for debugging
+                    logger.info(f"    - {label}({unique_key}={unique_value})")
+                    logger.info(f"      Properties: {props}")
+                    node_count += 1
+
+                if node_count >= limit:
+                    logger.info(f"    ... (showing first {limit} nodes)")
+            else:
+                logger.info("  No nodes found in database")
+
+            # Print all relationships - using properties() to get accurate data
+            logger.info("🔗 All relationships in database:")
+            rels_query = f"""
+            MATCH (a)-[r]->(b)
+            RETURN labels(a)[0] as from_label,
+                   properties(a) as from_props,
+                   type(r) as rel_type,
+                   labels(b)[0] as to_label,
+                   properties(b) as to_props
+            ORDER BY from_label, rel_type, to_label
+            LIMIT {limit}
+            """
+            rels_result = self._execute_query(rels_query)
+
+            if rels_result:
+                current_rel = None
+                rel_count = 0
+                for row in rels_result:
+                    from_label = row["from_label"]
+                    from_props = row["from_props"]
+                    rel_type = row["rel_type"]
+                    to_label = row["to_label"]
+                    to_props = row["to_props"]
+
+                    # Get unique identifiers
+                    from_unique_key = self.unique_constraints.get(from_label, "name")
+                    to_unique_key = self.unique_constraints.get(to_label, "name")
+
+                    from_unique_value = from_props.get(from_unique_key, "N/A")
+                    to_unique_value = to_props.get(to_unique_key, "N/A")
+
+                    # Group by relationship type for better readability
+                    rel_key = f"{from_label}--[{rel_type}]-->{to_label}"
+                    if current_rel != rel_key:
+                        current_rel = rel_key
+                        logger.info(f"  📂 {rel_key}:")
+
+                    logger.info(
+                        f"    - {from_label}({from_unique_key}={from_unique_value})--[{rel_type}]-->{to_label}({to_unique_key}={to_unique_value})"
+                    )
+                    rel_count += 1
+
+                if rel_count >= limit:
+                    logger.info(f"    ... (showing first {limit} relationships)")
+            else:
+                logger.info("  No relationships found in database")
+
+        except Exception as e:
+            logger.error(f"❌ Failed to print database contents: {e}")
 
     def fetch_all(self, query: str, params: dict[str, Any] | None = None) -> list:
         """Executes a query and fetches all results with enhanced logging and result formatting."""

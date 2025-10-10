@@ -54,6 +54,8 @@ class DefinitionProcessor:
         self.import_processor = import_processor
         self.module_qn_to_file_path = module_qn_to_file_path
         self.class_inheritance: dict[str, list[str]] = {}
+        # Store pending inheritance info for delayed processing (after all classes are registered)
+        self.pending_inheritance: dict[str, dict[str, Any]] = {}
 
     def _build_java_module_qn(self, file_path: Path, relative_path: Path) -> str:
         """Build module_qn for Java files by concatenating project_name and relative_path.
@@ -117,85 +119,6 @@ class DefinitionProcessor:
         except Exception as e:
             logger.debug(f"Failed to extract package from source for {file_path}: {e}")
 
-        return None
-
-    def _extract_java_module_name(
-        self, file_path: Path, relative_path: Path
-    ) -> str | None:
-        """Extract Java module name from file path.
-
-        For Java projects, the module name is typically found in the path structure.
-        Common patterns:
-        - src/main/java/com/example/ModuleName/...
-        - hellodemo-start/src/main/java/...
-        - hellodemo-service/src/main/java/...
-        - hellodemo-core/src/main/java/...
-        - hellodemo-main/src/main/java/...
-
-        Args:
-            file_path: The Java file path
-            relative_path: The relative path from repo root
-
-        Returns:
-            The Java module name if found, None otherwise
-        """
-        try:
-            parts = list(relative_path.parts)
-            logger.debug(f"Extracting Java module name from path: {relative_path}")
-            logger.debug(f"  Path parts: {parts}")
-
-            # Look for common module name patterns
-            # Pattern 1: Check if the first part looks like a module name (contains hyphen and followed by src)
-            if len(parts) >= 4 and parts[1] == "src":
-                first_part = parts[0]
-                logger.debug(f"  Checking first part: {first_part}")
-                # Check if it looks like a module name (contains hyphen, which is common in multi-module projects)
-                if "-" in first_part and not first_part.startswith(
-                    ("com.", "org.", "net.", "java.", "javax.")
-                ):
-                    # Special case: if the directory name contains the project name, extract the module part
-                    if first_part.startswith(f"{self.project_name}-"):
-                        # Extract module name by removing project name prefix
-                        module_name = first_part[len(f"{self.project_name}-") :]
-                        logger.debug(
-                            f"  ✅ Extracted module name from project-prefixed directory: {module_name}"
-                        )
-                        return module_name
-                    else:
-                        logger.debug(
-                            f"  ✅ Found module name in first part: {first_part}"
-                        )
-                        return first_part
-                else:
-                    logger.debug(
-                        f"  ❌ First part doesn't look like module name: {first_part}"
-                    )
-
-            # Pattern 2: Check if there's a module name in the project structure
-            # Look for directories that might contain module information
-            if file_path.exists():
-                logger.debug("  Checking file system for module name...")
-                # Try to find module information from the file system
-                current_path = file_path.parent
-                while (
-                    current_path != self.repo_path
-                    and current_path.parent != current_path
-                ):
-                    logger.debug(f"    Checking directory: {current_path.name}")
-                    # Check if this directory looks like a module (contains hyphen)
-                    if "-" in current_path.name and not current_path.name.startswith(
-                        ("com.", "org.", "net.", "java.", "javax.")
-                    ):
-                        logger.debug(
-                            f"  ✅ Found module name in directory: {current_path.name}"
-                        )
-                        return current_path.name
-                    current_path = current_path.parent
-
-        except Exception as e:
-            logger.debug(f"Failed to extract module name from {file_path}: {e}")
-
-        logger.debug(f"  ❌ No module name found for path: {relative_path}")
         return None
 
     def _get_node_type_for_inheritance(self, qualified_name: str) -> str:
@@ -295,11 +218,13 @@ class DefinitionProcessor:
                     else ("Project", "name", self.project_name)
                 )
             )
-            self.ingestor.ensure_relationship_batch(
-                (parent_label, parent_key, parent_val),
-                "CONTAINS_MODULE",
-                ("Module", "qualified_name", module_qn),
-            )
+            # Ignore CONTAINS_MODULE relationship for Java
+            if language != "java":
+                self.ingestor.ensure_relationship_batch(
+                    (parent_label, parent_key, parent_val),
+                    "CONTAINS_MODULE",
+                    ("Module", "qualified_name", module_qn),
+                )
 
             self.import_processor.parse_imports(root_node, module_qn, language, queries)
             self._ingest_missing_import_patterns(
@@ -310,7 +235,9 @@ class DefinitionProcessor:
                 self._ingest_cpp_module_declarations(
                     root_node, module_qn, file_path, queries
                 )
-            self._ingest_all_functions(root_node, module_qn, language, queries)
+            # For Java, skip processing functions since Java only has Methods (not Functions)
+            if language != "java":
+                self._ingest_all_functions(root_node, module_qn, language, queries)
             self._ingest_classes_and_methods(root_node, module_qn, language, queries)
             self._ingest_object_literal_methods(root_node, module_qn, language, queries)
             self._ingest_commonjs_exports(root_node, module_qn, language, queries)
@@ -1285,15 +1212,22 @@ class DefinitionProcessor:
             self.function_registry[class_qn] = node_type
             self.simple_name_lookup[class_name].add(class_qn)
 
-            # Track inheritance
-            parent_classes = self._extract_parent_classes(class_node, module_qn)
-            self.class_inheritance[class_qn] = parent_classes
+            # Store inheritance info for delayed processing (after all classes are registered)
+            # This ensures function_registry is fully populated before resolving parent classes
+            self.pending_inheritance[class_qn] = {
+                "class_node": class_node,
+                "module_qn": module_qn,
+                "node_type": node_type,
+                "language": language,
+            }
 
-            self.ingestor.ensure_relationship_batch(
-                ("Module", "qualified_name", module_qn),
-                "DEFINES",
-                (node_type, "qualified_name", class_qn),
-            )
+            # Ignore Module DEFINES Class relationship for Java
+            if language != "java":
+                self.ingestor.ensure_relationship_batch(
+                    ("Module", "qualified_name", module_qn),
+                    "DEFINES",
+                    (node_type, "qualified_name", class_qn),
+                )
 
             # Create export relationship if this is an exported C++ class
             if is_exported and language == "cpp":
@@ -1302,22 +1236,6 @@ class DefinitionProcessor:
                     "EXPORTS",
                     (node_type, "qualified_name", class_qn),
                 )
-
-            # Create INHERITS relationships for each parent class
-            for parent_class_qn in parent_classes:
-                self._create_inheritance_relationship(
-                    node_type, class_qn, parent_class_qn
-                )
-
-            # Handle Java interface implementations
-            if class_node.type == "class_declaration":
-                implemented_interfaces = self._extract_implemented_interfaces(
-                    class_node, module_qn
-                )
-                for interface_qn in implemented_interfaces:
-                    self._create_implements_relationship(
-                        node_type, class_qn, interface_qn
-                    )
 
             body_node = class_node.child_by_field_name("body")
             if not body_node:
@@ -1348,10 +1266,11 @@ class DefinitionProcessor:
                             # No parameters, use simple name
                             method_qualified_name = f"{class_qn}.{method_name}()"
 
+                # Use the correct container type (Class, Interface, Enum, etc.) not fixed "Class"
                 ingest_method(
                     method_node,
                     class_qn,
-                    "Class",
+                    node_type,  # Use actual node_type instead of hardcoded "Class"
                     self.ingestor,
                     self.function_registry,
                     self.simple_name_lookup,
@@ -1390,7 +1309,52 @@ class DefinitionProcessor:
             logger.info(
                 f"  Found Inline Module: {module_name} (qn: {inline_module_qn})"
             )
-            self.ingestor.ensure_node_batch("Module", module_props)
+            # Ignore inline Module node creation for Java
+            if language != "java":
+                self.ingestor.ensure_node_batch("Module", module_props)
+
+    def process_all_class_inheritance(self) -> None:
+        """Process inheritance relationships for all classes after all classes are registered.
+
+        This method is called after all files have been parsed and all classes are registered
+        in function_registry. This ensures that when resolving parent classes, all classes
+        are available for lookup.
+        """
+        logger.info("--- Pass 3.5: Processing Class Inheritance Relationships ---")
+        logger.info(
+            f"Processing inheritance for {len(self.pending_inheritance)} classes"
+        )
+
+        for class_qn, info in self.pending_inheritance.items():
+            class_node = info["class_node"]
+            module_qn = info["module_qn"]
+            node_type = info["node_type"]
+
+            logger.debug(f"Processing inheritance for class: {class_qn}")
+
+            # Extract parent classes (now function_registry is fully populated)
+            parent_classes = self._extract_parent_classes(class_node, module_qn)
+            self.class_inheritance[class_qn] = parent_classes
+
+            # Create INHERITS relationships for each parent class
+            for parent_class_qn in parent_classes:
+                self._create_inheritance_relationship(
+                    node_type, class_qn, parent_class_qn
+                )
+
+            # Handle Java interface implementations
+            if class_node.type == "class_declaration":
+                implemented_interfaces = self._extract_implemented_interfaces(
+                    class_node, module_qn
+                )
+                for interface_qn in implemented_interfaces:
+                    self._create_implements_relationship(
+                        node_type, class_qn, interface_qn
+                    )
+
+        logger.info(
+            f"Completed processing {len(self.pending_inheritance)} class inheritance relationships"
+        )
 
     def process_all_method_overrides(self) -> None:
         """Process OVERRIDES relationships for all methods after collection is complete."""
@@ -1506,11 +1470,38 @@ class DefinitionProcessor:
         parent_text = type_identifier_node.text
         if parent_text:
             parent_name = parent_text.decode("utf8")
-            # Resolve to full qualified name if possible
-            return (
-                self._resolve_class_name(parent_name, module_qn)
-                or f"{module_qn}.{parent_name}"
+            logger.debug(
+                f"🔍 Resolving superclass: parent_name='{parent_name}', module_qn='{module_qn}'"
             )
+
+            # Try to resolve from imports (returns Java package format if applicable)
+            resolved_from_import = self._resolve_class_name(parent_name, module_qn)
+            logger.debug(f"  📦 Resolved from import: '{resolved_from_import}'")
+
+            # For Java, need to convert package name to full file path format
+            if resolved_from_import:
+                # Check if resolved name looks like a Java package (contains common package prefixes)
+                # This is a Java package name, search registry for full path
+                full_parent_qn = self._find_java_interface_in_registry(
+                    resolved_from_import
+                )
+                if full_parent_qn:
+                    logger.info(
+                        f"  ✅ Resolved superclass: '{parent_name}' -> '{full_parent_qn}'"
+                    )
+                    return full_parent_qn
+                # Return resolved import as-is (might be external or already full path)
+                logger.warning(
+                    f"  ⚠️  Could not find superclass in registry, using import format: '{resolved_from_import}'"
+                )
+                return resolved_from_import
+
+            # Not found in imports, assume same package
+            same_package_qn = f"{module_qn}.{parent_name}"
+            logger.debug(
+                f"  ℹ️  Not in imports, assuming same package: '{same_package_qn}'"
+            )
+            return same_package_qn
         return None
 
     def _extract_parent_classes(self, class_node: Node, module_qn: str) -> list[str]:
@@ -2716,6 +2707,48 @@ class DefinitionProcessor:
         else:
             return f"{module_qn}.{function_name}"
 
+    def _find_java_interface_in_registry(self, java_package_name: str) -> str | None:
+        """Find interface in function_registry by Java package name.
+
+        Converts Java package format (com.alibaba.boot.diamond.listener.DiamondDataCallback)
+        to full file path format (hellodemo.hellodemo-service.src.main.java.com.alibaba.boot.diamond.listener.DiamondDataCallback)
+
+        Args:
+            java_package_name: Java package format name
+
+        Returns:
+            Full qualified name with project path prefix, or None if not found
+        """
+        logger.debug(f"🔍 Searching for Java class in registry: '{java_package_name}'")
+
+        # Search for entries in function_registry that end with this package name
+        # and are of type "Interface" or "Class"
+        for qn, entity_type in self.function_registry.items():
+            if entity_type in ("Interface", "Class", "Enum"):
+                # Check if this qualified name ends with the Java package name
+                # Use more strict matching: either exact match or ends with ".java_package_name"
+                if qn == java_package_name or qn.endswith("." + java_package_name):
+                    logger.info(
+                        f"✅ Found Java class in registry: '{java_package_name}' -> '{qn}' (type: {entity_type})"
+                    )
+                    return str(qn)
+
+        logger.warning(f"⚠️ Java class not found in registry: '{java_package_name}'")
+        # Debug: show some similar entries
+        logger.debug("📊 Sample entries in function_registry:")
+        count = 0
+        for qn, entity_type in self.function_registry.items():
+            if (
+                entity_type in ("Interface", "Class", "Enum")
+                and java_package_name.split(".")[-1] in qn
+            ):
+                logger.debug(f"  - {qn} ({entity_type})")
+                count += 1
+                if count >= 5:
+                    break
+
+        return None
+
     def _extract_implemented_interfaces(
         self, class_node: Node, module_qn: str
     ) -> list[str]:
@@ -2725,11 +2758,18 @@ class DefinitionProcessor:
         # Look for interfaces field in Java class declaration
         interfaces_node = class_node.child_by_field_name("interfaces")
         if interfaces_node:
+            logger.debug(
+                f"🔍 Extracting implemented interfaces for module: {module_qn}"
+            )
             # The interfaces node contains a super_interfaces structure
             # which has a type_list with comma-separated interface types
             self._extract_java_interface_names(
                 interfaces_node, implemented_interfaces, module_qn
             )
+            if implemented_interfaces:
+                logger.debug(
+                    f"  Found {len(implemented_interfaces)} implemented interfaces"
+                )
 
         return implemented_interfaces
 
@@ -2745,17 +2785,50 @@ class DefinitionProcessor:
                         interface_name = type_child.text
                         if interface_name:
                             interface_name_str = interface_name.decode("utf8")
-                            # Resolve to fully qualified name
-                            resolved_interface = (
-                                self._resolve_class_name(interface_name_str, module_qn)
-                                or f"{module_qn}.{interface_name_str}"
+                            logger.debug(
+                                f"    🔍 Resolving interface: {interface_name_str}"
                             )
-                            interface_list.append(resolved_interface)
+
+                            # First, try to resolve from imports (returns Java package format)
+                            resolved_from_import = self._resolve_class_name(
+                                interface_name_str, module_qn
+                            )
+                            logger.debug(
+                                f"      📦 Resolved from import: '{resolved_from_import}'"
+                            )
+
+                            # If found in imports, need to convert to file path format
+                            if resolved_from_import:
+                                # Search function_registry for interfaces matching this package name
+                                # The registry contains full paths like: hellodemo.hellodemo-service.src.main.java.com.alibaba...
+                                interface_qn = self._find_java_interface_in_registry(
+                                    resolved_from_import
+                                )
+                                if interface_qn:
+                                    logger.info(
+                                        f"      ✅ Resolved interface: '{interface_name_str}' -> '{interface_qn}'"
+                                    )
+                                    interface_list.append(interface_qn)
+                                else:
+                                    # Not found in registry, use the resolved import as-is
+                                    # (might be external or not yet parsed)
+                                    logger.warning(
+                                        f"      ⚠️  Interface not found in registry, using import format: '{resolved_from_import}'"
+                                    )
+                                    interface_list.append(resolved_from_import)
+                            else:
+                                # Not found in imports, assume same package
+                                interface_qn = f"{module_qn}.{interface_name_str}"
+                                logger.debug(
+                                    f"      ℹ️  Not in imports, assuming same package: '{interface_qn}'"
+                                )
+                                interface_list.append(interface_qn)
 
     def _create_implements_relationship(
         self, class_type: str, class_qn: str, interface_qn: str
     ) -> None:
         """Create an IMPLEMENTS relationship between a class and an interface."""
+        logger.info(f"  Creating IMPLEMENTS relationship: {class_qn} -> {interface_qn}")
         self.ingestor.ensure_relationship_batch(
             (class_type, "qualified_name", class_qn),
             "IMPLEMENTS",
